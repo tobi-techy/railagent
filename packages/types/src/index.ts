@@ -41,12 +41,31 @@ export const QuoteResponseSchema = z.object({
 
 export const TransferRequestSchema = z.object({
   quoteId: z.string().min(1),
-  recipient: z.string().min(1)
+  recipient: z.string().optional(),
+  amount: z.string().optional(),
+  fromToken: z.string().optional(),
+  toToken: z.string().optional()
 });
 
 export const TransferResponseSchema = z.object({
   id: z.string(),
-  status: z.literal("submitted")
+  status: z.literal("submitted"),
+  policyDecision: z.object({
+    allowed: z.boolean(),
+    violations: z.array(
+      z.object({
+        code: z.string(),
+        message: z.string(),
+        field: z.string().optional(),
+        meta: z.record(z.any()).optional()
+      })
+    )
+  }),
+  provider: z.object({
+    name: z.string(),
+    mode: z.enum(["mock", "live"]),
+    fallbackReason: z.string().optional()
+  })
 });
 
 export const TransferStatusResponseSchema = z.object({

@@ -15,7 +15,8 @@
     "zod": "^3.23.8",
     "@railagent/types": "workspace:*",
     "@railagent/intent-parser": "workspace:*",
-    "@railagent/core": "workspace:*"
+    "@railagent/core": "workspace:*",
+    "@railagent/mento-adapter": "workspace:*"
   },
   "devDependencies": {
     "tsx": "^4.19.1",

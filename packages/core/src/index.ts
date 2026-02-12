@@ -111,6 +111,8 @@ function estimateReceive(amount: number, candidate: RouteCandidate): string {
   return net.toFixed(6);
 }
 
+export * from "./policy.js";
+
 export function scoreRoutes(request: CorridorRequest): OptimizedQuote {
   const candidates = getMockCandidatesForCorridor(request.sourceCurrency, request.targetCurrency);
 

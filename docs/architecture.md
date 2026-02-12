@@ -1,25 +1,78 @@
-# RailAgent Architecture (Hackathon Scaffold)
+# RailAgent Architecture (Phase 2)
 
 ## Overview
 
-RailAgent is organized as a pnpm + TypeScript monorepo with clear boundaries between apps and reusable packages.
+RailAgent is a pnpm + TypeScript monorepo with clear boundaries between API, domain logic, and integration adapters.
 
 ## Monorepo layout
 
-- `apps/api`: Fastify HTTP API exposing intent parsing, quoting, and transfer lifecycle endpoints.
-- `apps/worker`: Placeholder for background jobs (settlement polling, retries, indexing).
+- `apps/api`: Fastify HTTP API exposing parsing, quoting, transfers, and webhook management.
+- `apps/worker`: Placeholder for background jobs.
 - `apps/demo-agent`: Placeholder for conversational/demo integration.
-- `packages/types`: Shared API schemas and TypeScript types (Zod as source of truth).
-- `packages/sdk-ts`: TypeScript SDK for external clients to call RailAgent API.
-- `packages/core`: Placeholder for business orchestration logic.
-- `packages/mento-adapter`: Placeholder for Mento protocol integration.
-- `packages/intent-parser`: Placeholder for NLP / intent extraction pipeline.
-- `infra/docker`: Placeholder for container files.
-- `infra/scripts`: Placeholder for operational scripts.
+- `packages/types`: Shared API schemas and TypeScript types (Zod source of truth).
+- `packages/intent-parser`: Deterministic multilingual intent extraction.
+- `packages/core`: Route scoring + transfer policy/safety evaluation.
+- `packages/mento-adapter`: Provider abstraction for quote/execution (mock + live stub).
+- `packages/sdk-ts`: SDK scaffold.
 
-## Design choices
+## Provider abstraction
 
-1. **Schemas first** with Zod in `packages/types` to keep API contracts consistent.
-2. **Thin API layer** in `apps/api` for fast iteration during hackathon.
-3. **SDK package** for clean integration from UIs/bots/agents.
-4. **Modular packages** reserved for scaling beyond MVP.
+`packages/mento-adapter` defines:
+
+- `QuoteProvider` interface
+- `ExecutionProvider` interface
+- `MockMentoProvider` (default deterministic behavior)
+- `LiveMentoProviderStub` (env-aware, explicit not-configured errors)
+
+Provider selection is centralized in `createMentoProviders()`:
+
+- `MENTO_PROVIDER_MODE=mock` → use mock provider
+- `MENTO_PROVIDER_MODE=live` + missing config → deterministic fallback to mock with `fallbackReason`
+
+This keeps local/dev setup runnable without secrets while preparing integration seams for live testnet execution.
+
+## Policy and safety layer
+
+`packages/core/src/policy.ts` evaluates transfer requests before execution:
+
+- max amount (`TRANSFER_MAX_AMOUNT`)
+- allowed corridors (`TRANSFER_ALLOWED_CORRIDORS`)
+- required recipient
+- required idempotency key
+
+Result is a structured policy decision:
+
+- `allowed: boolean`
+- `violations[]` with machine-readable `code`, `message`, `field`, and optional `meta`
+
+`POST /transfer` blocks execution and returns `422` if policy denies.
+
+## Webhook subsystem
+
+`apps/api/src/webhooks.ts` provides MVP webhook mechanics:
+
+- in-memory target registry
+- event envelope schema (`id`, `type`, `timestamp`, `data`)
+- HMAC-SHA256 signing using `WEBHOOK_SECRET`
+- retry queue with backoff (1s, 3s, 7s)
+
+Endpoints:
+
+- `POST /webhooks/register`
+- `GET /webhooks`
+
+Events emitted for transfer lifecycle:
+
+- `transfer.submitted`
+- `transfer.settled`
+- `transfer.failed` (reserved)
+
+## Runtime flow (`POST /transfer`)
+
+1. Validate request schema
+2. Read `Idempotency-Key`
+3. Evaluate policy
+4. Execute transfer via selected provider
+5. Store transfer status
+6. Emit signed webhook events
+7. Return transfer response with policy + provider metadata

@@ -8,7 +8,7 @@
     "build": "pnpm -r build",
     "dev:api": "pnpm -C apps/api dev",
     "typecheck": "pnpm -r typecheck",
-    "test": "node --import tsx --test packages/**/test/**/*.test.ts"
+    "test": "node --import tsx --test packages/**/test/**/*.test.ts apps/**/test/**/*.test.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.1",

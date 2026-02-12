@@ -10,97 +10,125 @@ Returns service health.
 
 Deterministic multilingual intent parsing (EN/ES/PT/FR) with confidence and clarification prompts.
 
-**Request**
-
-```json
-{
-  "text": "Envoyer 200 EUR vers NGN pour ade"
-}
-```
-
-**Response**
-
-```json
-{
-  "intent": "transfer",
-  "confidence": 0.96,
-  "extracted": {
-    "amount": 200,
-    "sourceCurrency": "EUR",
-    "targetCurrency": "NGN",
-    "recipient": "ade",
-    "destinationHint": "Nigeria",
-    "language": "fr",
-    "rawText": "Envoyer 200 EUR vers NGN pour ade",
-    "parsed": {
-      "amount": 200,
-      "sourceCurrency": "EUR",
-      "targetCurrency": "NGN",
-      "recipient": "ade",
-      "destinationHint": "Nigeria",
-      "language": "fr",
-      "rawText": "Envoyer 200 EUR vers NGN pour ade"
-    },
-    "needsClarification": false,
-    "clarificationQuestions": []
-  }
-}
-```
-
 ## POST /quote
 
 Weighted route optimization for supported corridors (`USD->PHP`, `EUR->NGN`, `GBP->KES`) with transparent scoring breakdown.
 
-**Request**
+## POST /transfer
+
+Creates a transfer after policy checks and returns provider metadata.
+
+### Headers
+
+- `Idempotency-Key` (required)
+
+### Request
 
 ```json
 {
-  "fromToken": "USD",
-  "toToken": "PHP",
+  "quoteId": "qt_123",
+  "recipient": "maria",
   "amount": "100",
-  "destinationChain": "celo"
+  "fromToken": "USD",
+  "toToken": "PHP"
 }
 ```
 
-**Response**
+### Success response
 
 ```json
 {
-  "bestRoute": {
-    "route": "celo->mento->gcash",
-    "estimatedReceive": "5602.660000",
-    "fee": "0.11",
-    "etaSeconds": 42,
-    "score": 0.761905,
-    "scoring": {
-      "weights": {
-        "rate": 0.4,
-        "slippageBps": 0.2,
-        "gasUsd": 0.15,
-        "etaSec": 0.1,
-        "liquidityDepth": 0.15
-      }
-    },
-    "metrics": {
-      "rate": 56.15,
-      "slippageBps": 20,
-      "gasUsd": 0.11,
-      "liquidityDepth": 680000
-    }
+  "id": "tr_idem_001",
+  "status": "submitted",
+  "policyDecision": {
+    "allowed": true,
+    "violations": []
   },
-  "alternatives": [],
-  "explanation": {
-    "corridor": "USD->PHP",
-    "strategy": "weighted-score(rate, slippage, gas, eta, liquidity)",
-    "consideredRoutes": 3
+  "provider": {
+    "name": "mock-mento",
+    "mode": "mock"
   }
 }
 ```
 
-## POST /transfer
+### Policy denial response
 
-Creates a mock transfer and returns submitted status.
+```json
+{
+  "error": "Transfer policy denied",
+  "code": "POLICY_VIOLATION",
+  "policyDecision": {
+    "allowed": false,
+    "violations": [
+      {
+        "code": "POLICY_IDEMPOTENCY_KEY_REQUIRED",
+        "message": "Idempotency key is required",
+        "field": "idempotencyKey"
+      }
+    ]
+  }
+}
+```
 
 ## GET /transfers/:id
 
-Returns mock transfer settlement status.
+Returns transfer status from in-memory store.
+
+## POST /webhooks/register
+
+Registers a webhook target (in-memory).
+
+### Request
+
+```json
+{
+  "url": "https://example.com/webhooks/railagent"
+}
+```
+
+### Response
+
+```json
+{
+  "webhook": {
+    "id": "wh_ab12cd34",
+    "url": "https://example.com/webhooks/railagent",
+    "createdAt": "2026-01-01T00:00:00.000Z"
+  }
+}
+```
+
+## GET /webhooks
+
+Returns all registered webhook targets.
+
+## Webhook delivery
+
+RailAgent emits transfer lifecycle events:
+
+- `transfer.submitted`
+- `transfer.settled`
+- `transfer.failed` (reserved)
+
+Headers sent with each webhook:
+
+- `x-railagent-event`
+- `x-railagent-signature` (hex HMAC-SHA256)
+
+### Signature verification example (Node.js)
+
+```ts
+import crypto from "node:crypto";
+
+const secret = process.env.WEBHOOK_SECRET!;
+const rawBody = requestBodyAsRawString;
+const signature = incomingHeaders["x-railagent-signature"];
+
+const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+
+if (signature !== expected) {
+  throw new Error("Invalid webhook signature");
+}
+```
+
+Retries use in-memory backoff for MVP (1s, 3s, 7s).

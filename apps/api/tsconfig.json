@@ -2,7 +2,10 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "src"
+    "baseUrl": ".",
+    "paths": {
+      "@railagent/mento-adapter": ["../../packages/mento-adapter/src/index.ts"]
+    }
   },
   "include": ["src"]
 }
