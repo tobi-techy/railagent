@@ -6,10 +6,13 @@ import {
   TransferRequest,
   TransferResponse,
   TransferStatusResponse,
+  AgentMessageRequest,
+  AgentMessageResponse,
   ParseIntentResponseSchema,
   QuoteResponseSchema,
   TransferResponseSchema,
-  TransferStatusResponseSchema
+  TransferStatusResponseSchema,
+  AgentMessageResponseSchema
 } from "@railagent/types";
 
 export interface RailAgentSdkOptions {
@@ -57,6 +60,11 @@ export class RailAgentSdk {
     }
     const data = await res.json();
     return TransferStatusResponseSchema.parse(data);
+  }
+
+  async agentMessage(payload: AgentMessageRequest): Promise<AgentMessageResponse> {
+    const data = await this.post("/agent/message", payload);
+    return AgentMessageResponseSchema.parse(data);
   }
 
   private async post(path: string, body: unknown, options?: RequestOptions): Promise<unknown> {

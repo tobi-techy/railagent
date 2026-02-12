@@ -1,37 +1,45 @@
-# Judge demo script (real-world remittance scenarios)
+# Judge-ready natural conversation demo
 
-## Scenario 1: Freelancer payout (USD -> PHP)
-- User: “Send 120 USD to Maria in Manila, convert to PHP.”
-- Show `/intent/parse` structured extraction.
-- Show `/quote` best + alternatives.
-- Execute `/transfer` with API key + idempotency header.
-- Mention policy and audit log event emitted.
-
-## Scenario 2: Family remittance (EUR -> NGN)
-- User: “Transfer 80 EUR to my brother in Lagos in NGN.”
-- Show destination detection and corridor routing.
-- Show low-fee route recommendation and ETA.
-
-## Scenario 3: Marketplace settlement (GBP -> KES)
-- User: “Pay 300 GBP settlement to vendor_kenya in KES.”
-- Demonstrate policy limits by trying 3000 GBP (blocked by per-currency cap).
-- Show returned `POLICY_VIOLATION` with explicit violation details.
-
----
-
-## Live demo commands
+## Setup
 
 ```bash
 pnpm dev:api
 ```
 
 ```bash
-pnpm demo:live
+pnpm -C apps/demo-agent dev -- --session-id judge-1
 ```
 
-Manual one-shot examples:
+## Live conversation flow
+
+1. User (EN typo/noisy):
+   - `pls sned 120 usd to my mom maria in manila to php every month`
+2. Agent:
+   - shows interpreted plan + confidence
+   - shows Celo route options and fee comparison savings
+   - asks for confirmation
+3. User follow-up memory turn:
+   - `use the cheapest option`
+4. Agent:
+   - reuses same session context and updates plan
+5. User confirmation:
+   - `yes send it now`
+
+## Multilingual spot checks
+
+- ES: `quiero enivar 50 eur para mi hermano jose en lagos a ngn mensual`
+- PT: `preciso tranfser 75 gbp para minha mae ana no kenya em kes mensal`
+- FR: `donne moi un deivs pour 200 eur vers ngn`
+
+## One-shot API-only run
 
 ```bash
-pnpm -C apps/demo-agent run --text "Transfer 80 EUR to jose in Lagos to NGN" --confirm
-pnpm -C apps/demo-agent run --text "Pay 300 GBP to vendor_kenya in KES" --confirm
+curl -X POST http://localhost:3000/agent/message -H 'content-type: application/json' -d '{"sessionId":"judge-1","text":"sned 120 usd to my mom in manila","confirm":false}'
+curl -X POST http://localhost:3000/agent/message -H 'content-type: application/json' -d '{"sessionId":"judge-1","text":"confirm","confirm":true}'
 ```
+
+## Important narration points
+
+- Celo stablecoin rail is used for transfer execution (provider abstraction mock/live stub).
+- idempotency + policy checks run before execution.
+- legacy fee comparisons are baseline estimates (not live third-party quotes).

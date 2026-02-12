@@ -58,6 +58,23 @@ export interface OptimizedQuote {
   };
 }
 
+export interface LegacyComparison {
+  provider: "Western Union" | "Wise";
+  estimatedFeeUsd: number;
+  estimatedEtaHours: number;
+}
+
+export interface FeeComparisonResult {
+  corridor: string;
+  amount: number;
+  railAgentFeeUsd: number;
+  legacy: LegacyComparison[];
+  legacyAverageFeeUsd: number;
+  savingsUsd: number;
+  savingsPct: number;
+  disclaimer: string;
+}
+
 const WEIGHTS = {
   rate: 0.4,
   slippageBps: 0.2,
@@ -65,6 +82,29 @@ const WEIGHTS = {
   etaSec: 0.1,
   liquidityDepth: 0.15
 } as const;
+
+const LEGACY_BASELINES: Record<string, Array<{ maxAmount: number; wuFeeUsd: number; wiseFeeUsd: number; etaHours: number }>> = {
+  "USD->PHP": [
+    { maxAmount: 100, wuFeeUsd: 8.5, wiseFeeUsd: 4.2, etaHours: 2 },
+    { maxAmount: 500, wuFeeUsd: 16, wiseFeeUsd: 8.8, etaHours: 4 },
+    { maxAmount: Infinity, wuFeeUsd: 27, wiseFeeUsd: 14.5, etaHours: 8 }
+  ],
+  "EUR->NGN": [
+    { maxAmount: 100, wuFeeUsd: 10, wiseFeeUsd: 5.6, etaHours: 3 },
+    { maxAmount: 500, wuFeeUsd: 18.5, wiseFeeUsd: 10.2, etaHours: 6 },
+    { maxAmount: Infinity, wuFeeUsd: 31, wiseFeeUsd: 17.5, etaHours: 12 }
+  ],
+  "GBP->KES": [
+    { maxAmount: 100, wuFeeUsd: 9.2, wiseFeeUsd: 4.9, etaHours: 2 },
+    { maxAmount: 500, wuFeeUsd: 17.3, wiseFeeUsd: 9.6, etaHours: 5 },
+    { maxAmount: Infinity, wuFeeUsd: 29.8, wiseFeeUsd: 16.2, etaHours: 10 }
+  ],
+  DEFAULT: [
+    { maxAmount: 100, wuFeeUsd: 9, wiseFeeUsd: 5, etaHours: 4 },
+    { maxAmount: 500, wuFeeUsd: 18, wiseFeeUsd: 10, etaHours: 8 },
+    { maxAmount: Infinity, wuFeeUsd: 30, wiseFeeUsd: 17, etaHours: 24 }
+  ]
+};
 
 function corridorKey(sourceCurrency: string, targetCurrency: string): string {
   return `${sourceCurrency.toUpperCase()}->${targetCurrency.toUpperCase()}`;
@@ -172,5 +212,38 @@ export function scoreRoutes(request: CorridorRequest): OptimizedQuote {
       consideredRoutes: candidates.length,
       weights: { ...WEIGHTS }
     }
+  };
+}
+
+export function compareRemittanceFees(input: {
+  sourceCurrency: string;
+  targetCurrency: string;
+  amount: number;
+  railAgentFeeUsd: number;
+}): FeeComparisonResult {
+  const corridor = corridorKey(input.sourceCurrency, input.targetCurrency);
+  const table = LEGACY_BASELINES[corridor] ?? LEGACY_BASELINES.DEFAULT;
+  const band = table.find((entry) => input.amount <= entry.maxAmount) ?? table[table.length - 1];
+
+  const legacy: LegacyComparison[] = [
+    { provider: "Western Union", estimatedFeeUsd: band.wuFeeUsd, estimatedEtaHours: band.etaHours },
+    { provider: "Wise", estimatedFeeUsd: band.wiseFeeUsd, estimatedEtaHours: Math.max(1, Math.floor(band.etaHours / 2)) }
+  ];
+
+  const legacyAverageFeeUsd = (legacy[0].estimatedFeeUsd + legacy[1].estimatedFeeUsd) / 2;
+  const savingsUsd = Number((legacyAverageFeeUsd - input.railAgentFeeUsd).toFixed(2));
+  const savingsPct = legacyAverageFeeUsd > 0
+    ? Number(((savingsUsd / legacyAverageFeeUsd) * 100).toFixed(2))
+    : 0;
+
+  return {
+    corridor,
+    amount: input.amount,
+    railAgentFeeUsd: input.railAgentFeeUsd,
+    legacy,
+    legacyAverageFeeUsd: Number(legacyAverageFeeUsd.toFixed(2)),
+    savingsUsd,
+    savingsPct,
+    disclaimer: "Fee/time comparisons are estimates from baseline tables, not live third-party quotes."
   };
 }

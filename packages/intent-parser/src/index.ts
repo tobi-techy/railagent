@@ -10,6 +10,8 @@ export interface ParsedIntentFields {
   targetCurrency?: string;
   recipient?: string;
   destinationHint?: string;
+  recipientRelation?: string;
+  recurringCadence?: "weekly" | "monthly" | "biweekly";
   language: SupportedLanguage;
   rawText: string;
 }
@@ -30,6 +32,11 @@ export interface ParseIntentRuntimeOptions {
   geminiApiKey?: string;
 }
 
+interface IntentNlpProvider {
+  mode: LlmProviderMode;
+  parse(input: string): Promise<IntentParseResult>;
+}
+
 const StructuredExtractionSchema = z.object({
   intent: z.enum(["transfer", "quote", "unknown"]),
   confidence: z.number().min(0).max(1),
@@ -39,6 +46,8 @@ const StructuredExtractionSchema = z.object({
     targetCurrency: z.string().min(3).max(6).optional(),
     recipient: z.string().min(2).optional(),
     destinationHint: z.string().optional(),
+    recipientRelation: z.string().optional(),
+    recurringCadence: z.enum(["weekly", "biweekly", "monthly"]).optional(),
     language: z.enum(["en", "es", "pt", "fr"]).default("en"),
     rawText: z.string()
   }),
@@ -46,159 +55,108 @@ const StructuredExtractionSchema = z.object({
   clarificationQuestions: z.array(z.string())
 });
 
-type LanguageHints = {
-  stopwords: string[];
-  keywords: string[];
-  transferPhrases: string[];
-  quotePhrases: string[];
-};
-
-const LANGUAGE_HINTS: Record<SupportedLanguage, LanguageHints> = {
-  en: {
-    stopwords: ["the", "to", "for", "please", "with", "my"],
-    keywords: ["send", "transfer", "quote", "rate", "recipient"],
-    transferPhrases: ["send", "transfer", "pay", "remit"],
-    quotePhrases: ["quote", "rate", "how much", "exchange"]
-  },
-  es: {
-    stopwords: ["el", "la", "para", "por", "con", "mi", "quiero", "necesito"],
-    keywords: ["enviar", "transferir", "cotizar", "tasa", "destinatario", "quiero", "hacia"],
-    transferPhrases: ["enviar", "transferir", "mandar", "pagar", "quiero enviar"],
-    quotePhrases: ["cotizar", "cotización", "tasa", "cambio", "quiero una cotización"]
-  },
-  pt: {
-    stopwords: ["o", "a", "para", "por", "com", "meu", "preciso", "no"],
-    keywords: ["enviar", "transferir", "cotação", "taxa", "destinatário", "preciso", "câmbio"],
-    transferPhrases: ["enviar", "transferir", "mandar", "pagar", "preciso transferir"],
-    quotePhrases: ["cotação", "cotar", "taxa", "câmbio", "qual a cotação"]
-  },
-  fr: {
-    stopwords: ["le", "la", "pour", "avec", "mon", "vers"],
-    keywords: ["envoyer", "transférer", "devis", "taux", "destinataire"],
-    transferPhrases: ["envoyer", "transférer", "payer", "remettre"],
-    quotePhrases: ["devis", "taux", "combien", "change"]
-  }
+const LANGUAGE_HINTS: Record<SupportedLanguage, string[]> = {
+  en: ["send", "transfer", "quote", "how much", "monthly", "mom", "brother"],
+  es: ["enviar", "transferir", "cotizacion", "quiero", "mensual", "mama", "hermano"],
+  pt: ["enviar", "transferir", "cotacao", "preciso", "mensal", "mae", "irmao"],
+  fr: ["envoyer", "transferer", "devis", "mensuel", "maman", "frere", "vers", "donne"]
 };
 
 const CURRENCY_ALIASES: Record<string, string> = {
-  usd: "USD",
-  "$": "USD",
-  eur: "EUR",
-  "€": "EUR",
-  gbp: "GBP",
-  "£": "GBP",
-  php: "PHP",
-  ngn: "NGN",
-  kes: "KES",
-  dollars: "USD",
-  euro: "EUR",
-  euros: "EUR",
-  pounds: "GBP",
-  shillings: "KES",
-  naira: "NGN",
-  pesos: "PHP"
+  usd: "USD", eur: "EUR", gbp: "GBP", php: "PHP", ngn: "NGN", kes: "KES",
+  dollars: "USD", euro: "EUR", euros: "EUR", pounds: "GBP", naira: "NGN", shillings: "KES", pesos: "PHP",
+  "$": "USD", "€": "EUR", "£": "GBP"
 };
 
-const DESTINATION_HINTS: Record<string, string> = {
-  philippines: "Philippines",
-  manila: "Philippines",
-  nigeria: "Nigeria",
-  lagos: "Nigeria",
-  kenya: "Kenya",
-  nairobi: "Kenya"
-};
+const RELATION_HINTS = ["mom", "mother", "brother", "sister", "mamá", "mama", "hermano", "mãe", "irmao", "maman", "frere"];
+
+const TYPO_INTENT_HINTS = ["sned", "trasnfer", "enivar", "tranfser", "envair", "deivs", "cotaçao", "cotizasion"];
+
+function normalizeText(text: string): string {
+  return text.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
 function detectLanguage(text: string): SupportedLanguage {
-  const normalized = text.toLowerCase();
-  const tokens = normalized.split(/[^\p{L}\p{N}€$£]+/u).filter(Boolean);
-
-  let bestLanguage: SupportedLanguage = "en";
-  let bestScore = Number.NEGATIVE_INFINITY;
-
-  for (const [language, hints] of Object.entries(LANGUAGE_HINTS) as Array<[SupportedLanguage, LanguageHints]>) {
-    let score = 0;
-
-    for (const token of tokens) {
-      if (hints.stopwords.includes(token)) score += 1.1;
-      if (hints.keywords.includes(token)) score += 2;
-    }
-
-    for (const phrase of [...hints.transferPhrases, ...hints.quotePhrases]) {
-      if (normalized.includes(phrase)) score += 1.5;
-    }
-
+  const normalized = normalizeText(text);
+  let best: SupportedLanguage = "en";
+  let bestScore = -1;
+  for (const [lang, hints] of Object.entries(LANGUAGE_HINTS) as Array<[SupportedLanguage, string[]]>) {
+    const score = hints.reduce((acc, hint) => acc + (normalized.includes(normalizeText(hint)) ? 1 : 0), 0);
     if (score > bestScore) {
-      bestLanguage = language;
+      best = lang;
       bestScore = score;
     }
   }
-
-  return bestLanguage;
+  return best;
 }
 
 function parseAmount(text: string): number | undefined {
-  const amountMatch = text.match(/(?:^|\s)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?:\s|$)/);
-  if (!amountMatch) return undefined;
-
-  const raw = amountMatch[1];
+  const match = text.match(/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)/);
+  if (!match) return undefined;
+  const raw = match[1];
   const normalized = raw.includes(",") && raw.includes(".") ? raw.replace(/,/g, "") : raw.replace(",", ".");
-
   const parsed = Number.parseFloat(normalized);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function parseCurrencies(text: string): { sourceCurrency?: string; targetCurrency?: string } {
-  const normalized = text.toLowerCase();
+  const normalized = normalizeText(text);
   const tokens = normalized.split(/[^\p{L}\p{N}€$£]+/u).filter(Boolean);
-
-  const detectedCurrencies = tokens
-    .map((token) => CURRENCY_ALIASES[token])
-    .filter((value): value is string => Boolean(value));
-
-  const uniq = [...new Set(detectedCurrencies)];
+  const detected = [...new Set(tokens.map((t) => CURRENCY_ALIASES[t]).filter(Boolean))] as string[];
 
   const pairMatch = normalized.match(/([a-z€$£]{1,6})\s*(?:to|->|a|para|vers|em)\s*([a-z€$£]{1,6})/i);
   if (pairMatch) {
     const source = CURRENCY_ALIASES[pairMatch[1].toLowerCase()];
     const target = CURRENCY_ALIASES[pairMatch[2].toLowerCase()];
     if (source || target) {
-      return { sourceCurrency: source ?? uniq[0], targetCurrency: target ?? uniq[1] };
+      return {
+        sourceCurrency: source ?? detected[0],
+        targetCurrency: target ?? detected[1]
+      };
     }
   }
 
-  return {
-    sourceCurrency: uniq[0],
-    targetCurrency: uniq[1]
-  };
+  return { sourceCurrency: detected[0], targetCurrency: detected[1] };
 }
 
 function parseRecipient(text: string): string | undefined {
-  const match = text.match(/(?:to|a|para|vers)\s+([@\w.-]{2,}|0x[a-fA-F0-9]{6,})/i);
-  return match?.[1];
+  const m = text.match(/(?:to|a|para|vers|pour)\s+([@\w.-]{2,}|0x[a-fA-F0-9]{6,})/i);
+  return m?.[1];
 }
 
-function parseDestinationHint(text: string): string | undefined {
-  const normalized = text.toLowerCase();
-  for (const [key, destination] of Object.entries(DESTINATION_HINTS)) {
-    if (normalized.includes(key)) return destination;
-  }
+function parseRecurring(text: string): ParsedIntentFields["recurringCadence"] {
+  const n = normalizeText(text);
+  if (/(monthly|every month|mensual|mensal|mensuel|todo mes)/.test(n)) return "monthly";
+  if (/(weekly|semanal|hebdo)/.test(n)) return "weekly";
+  if (/(biweekly|quinzenal|cada dos semanas)/.test(n)) return "biweekly";
   return undefined;
 }
 
-function detectIntent(text: string, language: SupportedLanguage): ParsedIntentType {
-  const normalized = text.toLowerCase();
-  const hints = LANGUAGE_HINTS[language];
+function parseRelation(text: string): string | undefined {
+  const normalized = normalizeText(text);
+  return RELATION_HINTS.find((h) => normalized.includes(h));
+}
 
-  const hasTransferSignal = hints.transferPhrases.some((phrase) => normalized.includes(phrase));
-  const hasQuoteSignal = hints.quotePhrases.some((phrase) => normalized.includes(phrase));
+function parseDestinationHint(text: string): string | undefined {
+  const n = normalizeText(text);
+  if (n.includes("manila") || n.includes("philippines")) return "Philippines";
+  if (n.includes("lagos") || n.includes("nigeria")) return "Nigeria";
+  if (n.includes("nairobi") || n.includes("kenya")) return "Kenya";
+  return undefined;
+}
 
-  if (hasTransferSignal && !hasQuoteSignal) return "transfer";
-  if (hasQuoteSignal && !hasTransferSignal) return "quote";
-  if (hasTransferSignal && hasQuoteSignal) return "transfer";
+function detectIntent(text: string): ParsedIntentType {
+  const n = normalizeText(text);
+  const transfer = /(send|transfer|pay|remit|enviar|transferir|envoyer|transferrer|sned|trasnfer|enivar)/.test(n);
+  const quote = /(quote|rate|devis|cotizacion|cotacao|cotar|deivs|cotizasion)/.test(n);
+  if (transfer && !quote) return "transfer";
+  if (quote && !transfer) return "quote";
+  if (transfer && quote) return "transfer";
+  if (TYPO_INTENT_HINTS.some((t) => n.includes(t))) return "transfer";
   return "unknown";
 }
 
@@ -207,47 +165,34 @@ export function parseIntent(input: string): IntentParseResult {
   const amount = parseAmount(input);
   const { sourceCurrency, targetCurrency } = parseCurrencies(input);
   const recipient = parseRecipient(input);
+  const recurringCadence = parseRecurring(input);
+  const recipientRelation = parseRelation(input);
   const destinationHint = parseDestinationHint(input);
-  const intent = detectIntent(input, language);
+  const intent = detectIntent(input);
 
   const clarificationQuestions: string[] = [];
-
-  let confidence = intent === "unknown" ? 0.3 : 0.62;
-
-  if (amount !== undefined) confidence += 0.12;
-  else clarificationQuestions.push("What amount do you want to transfer?");
-
-  if (sourceCurrency) confidence += 0.08;
-  else clarificationQuestions.push("Which source currency should I use?");
-
-  if (targetCurrency) confidence += 0.08;
-  else clarificationQuestions.push("Which target currency should the recipient get?");
-
-  if (recipient) confidence += 0.06;
-  else if (intent === "transfer") clarificationQuestions.push("Who is the recipient?");
-
+  let confidence = intent === "unknown" ? 0.25 : 0.62;
+  if (amount !== undefined) confidence += 0.1; else clarificationQuestions.push("What amount should I send?");
+  if (sourceCurrency) confidence += 0.08; else clarificationQuestions.push("Which currency are you sending from?");
+  if (targetCurrency) confidence += 0.08; else clarificationQuestions.push("Which currency should the recipient receive?");
+  if (recipient) confidence += 0.08;
   if (destinationHint) confidence += 0.04;
+  if (recurringCadence) confidence += 0.04;
 
-  if (sourceCurrency && targetCurrency && sourceCurrency === targetCurrency) {
-    confidence -= 0.2;
-    clarificationQuestions.push("Source and target currencies look the same. Should I convert or keep the same currency?");
-  }
-
-  if (intent === "unknown") {
-    clarificationQuestions.unshift("Do you want to transfer funds or request a quote?");
-  }
-
-  confidence = clamp(confidence, 0, 0.99);
+  if (intent === "transfer" && !recipient) clarificationQuestions.push("Who should receive the transfer?");
+  if (intent === "unknown") clarificationQuestions.unshift("Do you want a transfer or only a quote?");
 
   return {
     intent,
-    confidence,
+    confidence: clamp(confidence, 0, 0.98),
     parsed: {
       amount,
       sourceCurrency,
       targetCurrency,
       recipient,
       destinationHint,
+      recipientRelation,
+      recurringCadence,
       language,
       rawText: input
     },
@@ -257,91 +202,101 @@ export function parseIntent(input: string): IntentParseResult {
   };
 }
 
-function normalizeStructured(result: z.infer<typeof StructuredExtractionSchema>): IntentParseResult {
-  return {
-    ...result,
-    parsed: {
-      ...result.parsed,
-      sourceCurrency: result.parsed.sourceCurrency?.toUpperCase(),
-      targetCurrency: result.parsed.targetCurrency?.toUpperCase()
-    },
-    provider: "openclaw"
-  };
+function extractionPrompt(input: string): string {
+  return [
+    "You are a remittance extraction model.",
+    "Understand English, Spanish, Portuguese, French, including typos/grammar errors.",
+    "Return strict JSON matching schema keys: intent, confidence, parsed, needsClarification, clarificationQuestions.",
+    "Include parsed.recurringCadence and parsed.recipientRelation when present.",
+    `Input: ${input}`
+  ].join("\n");
 }
 
-async function parseWithGemini(input: string, apiKey: string, model: string): Promise<IntentParseResult> {
-  const prompt = `Extract remittance intent into strict JSON only.\nSchema keys: intent, confidence, parsed, needsClarification, clarificationQuestions.\nInput: ${input}`;
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
-      })
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`GEMINI_HTTP_${response.status}`);
+function tryRepairJson(raw: string, input: string): IntentParseResult | undefined {
+  const jsonSlice = raw.match(/\{[\s\S]*\}/)?.[0];
+  if (!jsonSlice) return undefined;
+  try {
+    const parsed = JSON.parse(jsonSlice);
+    const validated = StructuredExtractionSchema.parse({ ...parsed, parsed: { ...parsed.parsed, rawText: input } });
+    return {
+      ...validated,
+      parsed: {
+        ...validated.parsed,
+        sourceCurrency: validated.parsed.sourceCurrency?.toUpperCase(),
+        targetCurrency: validated.parsed.targetCurrency?.toUpperCase()
+      },
+      provider: "gemini"
+    };
+  } catch {
+    return undefined;
   }
-
-  const payload = await response.json() as any;
-  const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("GEMINI_EMPTY_RESPONSE");
-
-  const parsedJson = JSON.parse(text);
-  const validated = StructuredExtractionSchema.parse({
-    ...parsedJson,
-    parsed: { ...parsedJson.parsed, rawText: input }
-  });
-
-  return {
-    ...validated,
-    parsed: {
-      ...validated.parsed,
-      sourceCurrency: validated.parsed.sourceCurrency?.toUpperCase(),
-      targetCurrency: validated.parsed.targetCurrency?.toUpperCase()
-    },
-    provider: "gemini"
-  };
 }
 
-async function parseWithOpenClawNative(_input: string): Promise<IntentParseResult> {
-  throw new Error("OPENCLAW_PROVIDER_UNAVAILABLE");
+class GeminiProvider implements IntentNlpProvider {
+  mode: LlmProviderMode = "gemini";
+  constructor(private readonly apiKey: string, private readonly model: string) {}
+
+  async parse(input: string): Promise<IntentParseResult> {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: extractionPrompt(input) }] }],
+          generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
+        })
+      }
+    );
+
+    if (!response.ok) throw new Error(`GEMINI_HTTP_${response.status}`);
+    const payload = await response.json() as any;
+    const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("GEMINI_EMPTY_RESPONSE");
+
+    try {
+      const parsed = JSON.parse(text);
+      const validated = StructuredExtractionSchema.parse({ ...parsed, parsed: { ...parsed.parsed, rawText: input } });
+      return {
+        ...validated,
+        parsed: {
+          ...validated.parsed,
+          sourceCurrency: validated.parsed.sourceCurrency?.toUpperCase(),
+          targetCurrency: validated.parsed.targetCurrency?.toUpperCase()
+        },
+        provider: "gemini"
+      };
+    } catch {
+      const repaired = tryRepairJson(text, input);
+      if (!repaired) throw new Error("GEMINI_INVALID_STRUCTURED_OUTPUT");
+      return repaired;
+    }
+  }
 }
 
-export async function parseIntentWithProvider(
-  input: string,
-  options: ParseIntentRuntimeOptions = {}
-): Promise<IntentParseResult> {
+class OpenClawProvider implements IntentNlpProvider {
+  mode: LlmProviderMode = "openclaw";
+  async parse(_input: string): Promise<IntentParseResult> {
+    throw new Error("OPENCLAW_PROVIDER_UNAVAILABLE");
+  }
+}
+
+export async function parseIntentWithProvider(input: string, options: ParseIntentRuntimeOptions = {}): Promise<IntentParseResult> {
   const provider = (options.provider ?? process.env.AI_PROVIDER ?? "deterministic").toLowerCase();
   const geminiModel = options.model ?? process.env.GEMINI_MODEL ?? "gemini-1.5-flash";
   const geminiApiKey = options.geminiApiKey ?? process.env.GEMINI_API_KEY;
 
-  if (provider === "gemini" && geminiApiKey) {
-    try {
-      return await parseWithGemini(input, geminiApiKey, geminiModel);
-    } catch (error) {
-      const fallback = parseIntent(input);
-      return {
-        ...fallback,
-        fallbackReason: error instanceof Error ? error.message : "GEMINI_PARSE_FAILED"
-      };
+  try {
+    if (provider === "gemini" && geminiApiKey) {
+      return await new GeminiProvider(geminiApiKey, geminiModel).parse(input);
     }
-  }
 
-  if (provider === "openclaw") {
-    try {
-      return await parseWithOpenClawNative(input);
-    } catch (error) {
-      const fallback = parseIntent(input);
-      return {
-        ...fallback,
-        fallbackReason: error instanceof Error ? error.message : "OPENCLAW_PARSE_FAILED"
-      };
+    if (provider === "openclaw") {
+      return await new OpenClawProvider().parse(input);
     }
+  } catch (error) {
+    const fallback = parseIntent(input);
+    return { ...fallback, fallbackReason: error instanceof Error ? error.message : "PARSE_FAILED" };
   }
 
   return parseIntent(input);
