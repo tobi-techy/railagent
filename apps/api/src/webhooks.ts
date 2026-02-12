@@ -54,8 +54,8 @@ export class WebhookDispatcher {
     return target;
   }
 
-  signPayload(rawPayload: string): string {
-    return crypto.createHmac("sha256", this.secret).update(rawPayload).digest("hex");
+  signPayload(rawPayload: string, timestamp: string): string {
+    return crypto.createHmac("sha256", this.secret).update(`${timestamp}.${rawPayload}`).digest("hex");
   }
 
   enqueueEvent(event: WebhookEventPayload): void {
@@ -89,7 +89,8 @@ export class WebhookDispatcher {
 
   private async deliver(target: WebhookTarget, event: WebhookEventPayload): Promise<boolean> {
     const rawPayload = JSON.stringify(event);
-    const signature = this.signPayload(rawPayload);
+    const ts = `${Math.floor(Date.now() / 1000)}`;
+    const signature = this.signPayload(rawPayload, ts);
 
     try {
       const response = await fetch(target.url, {
@@ -97,6 +98,7 @@ export class WebhookDispatcher {
         headers: {
           "content-type": "application/json",
           "x-railagent-signature": signature,
+          "x-railagent-timestamp": ts,
           "x-railagent-event": event.type
         },
         body: rawPayload

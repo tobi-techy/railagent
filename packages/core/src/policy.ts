@@ -1,8 +1,10 @@
 export interface TransferPolicyConfig {
   maxAmount: number;
+  maxAmountPerCurrency: Record<string, number>;
   allowedCorridors: string[];
   requireRecipient: boolean;
   requireIdempotencyKey: boolean;
+  riskDestinations: string[];
 }
 
 export interface TransferPolicyInput {
@@ -10,11 +12,19 @@ export interface TransferPolicyInput {
   fromToken?: string;
   toToken?: string;
   recipient?: string;
+  destinationHint?: string;
   idempotencyKey?: string;
 }
 
 export interface PolicyViolation {
-  code: "POLICY_RECIPIENT_REQUIRED" | "POLICY_IDEMPOTENCY_KEY_REQUIRED" | "POLICY_AMOUNT_REQUIRED" | "POLICY_MAX_AMOUNT_EXCEEDED" | "POLICY_CORRIDOR_NOT_ALLOWED";
+  code:
+    | "POLICY_RECIPIENT_REQUIRED"
+    | "POLICY_IDEMPOTENCY_KEY_REQUIRED"
+    | "POLICY_AMOUNT_REQUIRED"
+    | "POLICY_MAX_AMOUNT_EXCEEDED"
+    | "POLICY_CURRENCY_MAX_EXCEEDED"
+    | "POLICY_CORRIDOR_NOT_ALLOWED"
+    | "POLICY_RISK_DESTINATION";
   message: string;
   field?: string;
   meta?: Record<string, unknown>;
@@ -27,7 +37,19 @@ export interface PolicyDecision {
     corridor?: string;
     amount?: number;
     maxAmount: number;
+    destinationHint?: string;
   };
+}
+
+function parseCurrencyLimits(raw: string | undefined): Record<string, number> {
+  if (!raw) return {};
+  const out: Record<string, number> = {};
+  for (const item of raw.split(",").map((v) => v.trim()).filter(Boolean)) {
+    const [currency, value] = item.split(":");
+    const parsed = Number(value);
+    if (currency && Number.isFinite(parsed)) out[currency.toUpperCase()] = parsed;
+  }
+  return out;
 }
 
 export function readTransferPolicyConfig(env: NodeJS.ProcessEnv = process.env): TransferPolicyConfig {
@@ -39,9 +61,14 @@ export function readTransferPolicyConfig(env: NodeJS.ProcessEnv = process.env): 
 
   return {
     maxAmount: Number.isFinite(maxAmount) ? maxAmount : 1000,
+    maxAmountPerCurrency: parseCurrencyLimits(env.TRANSFER_MAX_BY_CURRENCY),
     allowedCorridors,
     requireRecipient: true,
-    requireIdempotencyKey: true
+    requireIdempotencyKey: true,
+    riskDestinations: (env.TRANSFER_RISK_DESTINATIONS ?? "")
+      .split(",")
+      .map((v) => v.trim().toLowerCase())
+      .filter(Boolean)
   };
 }
 
@@ -72,12 +99,33 @@ export function evaluateTransferPolicy(
     });
   }
 
+  const fromToken = input.fromToken?.toUpperCase();
+  const perCurrencyLimit = fromToken ? (config.maxAmountPerCurrency ?? {})[fromToken] : undefined;
+  if (input.amount && perCurrencyLimit && input.amount > perCurrencyLimit) {
+    violations.push({
+      code: "POLICY_CURRENCY_MAX_EXCEEDED",
+      field: "amount",
+      message: `${fromToken} transfers above ${perCurrencyLimit} are blocked by policy`,
+      meta: { currency: fromToken, limit: perCurrencyLimit, receivedAmount: input.amount }
+    });
+  }
+
   if (!corridor || !config.allowedCorridors.includes(corridor)) {
     violations.push({
       code: "POLICY_CORRIDOR_NOT_ALLOWED",
       field: "fromToken,toToken",
       message: "Transfer corridor is not allowed",
       meta: { allowedCorridors: config.allowedCorridors, requestedCorridor: corridor }
+    });
+  }
+
+  const destinationHint = input.destinationHint?.toLowerCase();
+  if (destinationHint && config.riskDestinations.includes(destinationHint)) {
+    violations.push({
+      code: "POLICY_RISK_DESTINATION",
+      field: "destinationHint",
+      message: `Destination ${input.destinationHint} is currently flagged for manual review`,
+      meta: { riskDestinations: config.riskDestinations }
     });
   }
 
@@ -103,7 +151,8 @@ export function evaluateTransferPolicy(
     context: {
       corridor,
       amount: input.amount,
-      maxAmount: config.maxAmount
+      maxAmount: config.maxAmount,
+      destinationHint: input.destinationHint
     }
   };
 }

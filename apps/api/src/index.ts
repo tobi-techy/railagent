@@ -10,14 +10,29 @@ import {
   TransferStatusResponseSchema,
   HealthResponseSchema
 } from "@railagent/types";
-import { parseIntent } from "@railagent/intent-parser";
+import { parseIntentWithProvider } from "@railagent/intent-parser";
 import { evaluateTransferPolicy, readTransferPolicyConfig, scoreRoutes } from "@railagent/core";
 import { createMentoProviders } from "@railagent/mento-adapter";
 import { createWebhookEvent, WebhookDispatcher } from "./webhooks.js";
+import {
+  ApiError,
+  assertApiKey,
+  enforceRateLimit,
+  requestIdentity,
+  sanitizeForAudit,
+  sendApiError,
+  verifyWebhookSignature
+} from "./security.js";
 
 const app = Fastify({ logger: true });
 const port = Number(process.env.PORT ?? 3000);
 const webhookSecret = process.env.WEBHOOK_SECRET ?? "dev_webhook_secret";
+const writeApiKeys = (process.env.API_WRITE_KEYS ?? "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+const rateLimitPerMin = Number(process.env.RATE_LIMIT_PER_MIN ?? "60");
+const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS ?? "60000");
 
 const providerSelection = createMentoProviders(process.env);
 const policyConfig = readTransferPolicyConfig(process.env);
@@ -25,6 +40,26 @@ const webhookDispatcher = new WebhookDispatcher(webhookSecret);
 const transferStore = new Map<string, { status: "submitted" | "settled" | "failed"; txHash?: string }>();
 
 await app.register(cors, { origin: true });
+
+app.setErrorHandler((error, _request, reply) => {
+  sendApiError(reply, error);
+});
+
+app.addHook("onRequest", async (request, reply) => {
+  const correlationId = request.id;
+  reply.header("x-correlation-id", correlationId);
+
+  const identity = requestIdentity(request);
+  const rate = enforceRateLimit(`${identity}:${request.url}`, rateLimitPerMin, rateLimitWindowMs);
+  reply.header("x-ratelimit-remaining", String(rate.remaining));
+  reply.header("x-ratelimit-reset", String(Math.floor(rate.resetAt / 1000)));
+
+  if (!rate.allowed) {
+    throw new ApiError(429, "RATE_LIMITED", "Too many requests");
+  }
+
+  app.log.info({ correlationId, path: request.url, method: request.method, identity }, "request.received");
+});
 
 app.addHook("onClose", async () => {
   webhookDispatcher.stop();
@@ -41,10 +76,29 @@ app.get("/health", async () => {
 app.post("/intent/parse", async (request, reply) => {
   const parsed = ParseIntentRequestSchema.safeParse(request.body);
   if (!parsed.success) {
-    return reply.code(400).send({ error: "Invalid request", details: parsed.error.flatten() });
+    throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
   }
 
-  const parsedIntent = parseIntent(parsed.data.text);
+  const parsedIntent = await parseIntentWithProvider(parsed.data.text, {
+    provider: process.env.AI_PROVIDER,
+    model: process.env.AI_MODEL,
+    geminiApiKey: process.env.GEMINI_API_KEY
+  });
+
+  app.log.info(
+    {
+      event: "audit.parse_decision",
+      correlationId: request.id,
+      payload: sanitizeForAudit({
+        provider: parsedIntent.provider,
+        fallbackReason: parsedIntent.fallbackReason,
+        intent: parsedIntent.intent,
+        confidence: parsedIntent.confidence,
+        parsed: parsedIntent.parsed
+      })
+    },
+    "audit"
+  );
 
   return ParseIntentResponseSchema.parse({
     intent: parsedIntent.intent,
@@ -53,24 +107,31 @@ app.post("/intent/parse", async (request, reply) => {
       ...parsedIntent.parsed,
       parsed: parsedIntent.parsed,
       needsClarification: parsedIntent.needsClarification,
-      clarificationQuestions: parsedIntent.clarificationQuestions
+      clarificationQuestions: parsedIntent.clarificationQuestions,
+      provider: parsedIntent.provider,
+      fallbackReason: parsedIntent.fallbackReason
     }
   });
 });
 
-app.post("/quote", async (request, reply) => {
+app.post("/quote", async (request) => {
   const parsed = QuoteRequestSchema.safeParse(request.body);
   if (!parsed.success) {
-    return reply.code(400).send({ error: "Invalid request", details: parsed.error.flatten() });
+    throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
   }
 
   const amount = Number(parsed.data.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new ApiError(422, "INVALID_AMOUNT", "amount must be a positive number-like string");
+  }
 
   const optimized = scoreRoutes({
     sourceCurrency: parsed.data.fromToken,
     targetCurrency: parsed.data.toToken,
-    amount: Number.isFinite(amount) ? amount : 0
+    amount
   });
+
+  app.log.info({ event: "audit.quote_decision", correlationId: request.id, payload: sanitizeForAudit(optimized.explanation) }, "audit");
 
   const toApiRoute = (item: (typeof optimized.alternatives)[number]) => ({
     route: item.candidate.route,
@@ -94,10 +155,12 @@ app.post("/quote", async (request, reply) => {
   });
 });
 
-app.post("/transfer", async (request, reply) => {
+app.post("/transfer", async (request) => {
+  assertApiKey(request, writeApiKeys);
+
   const parsed = TransferRequestSchema.safeParse(request.body);
   if (!parsed.success) {
-    return reply.code(400).send({ error: "Invalid request", details: parsed.error.flatten() });
+    throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
   }
 
   const idempotencyKey = request.headers["idempotency-key"]?.toString();
@@ -114,12 +177,10 @@ app.post("/transfer", async (request, reply) => {
     policyConfig
   );
 
+  app.log.info({ event: "audit.transfer_policy", correlationId: request.id, payload: sanitizeForAudit(policyDecision) }, "audit");
+
   if (!policyDecision.allowed) {
-    return reply.code(422).send({
-      error: "Transfer policy denied",
-      code: "POLICY_VIOLATION",
-      policyDecision
-    });
+    throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
   }
 
   const execution = await providerSelection.executionProvider.executeTransfer({
@@ -170,12 +231,12 @@ app.post("/transfer", async (request, reply) => {
   });
 });
 
-app.get("/transfers/:id", async (request, reply) => {
+app.get("/transfers/:id", async (request) => {
   const { id } = request.params as { id: string };
   const transfer = transferStore.get(id);
 
   if (!transfer) {
-    return reply.code(404).send({ error: "Transfer not found", code: "TRANSFER_NOT_FOUND" });
+    throw new ApiError(404, "TRANSFER_NOT_FOUND", "Transfer not found");
   }
 
   return TransferStatusResponseSchema.parse({
@@ -186,16 +247,17 @@ app.get("/transfers/:id", async (request, reply) => {
 });
 
 app.post("/webhooks/register", async (request, reply) => {
+  assertApiKey(request, writeApiKeys);
   const body = request.body as { url?: string };
 
   if (!body?.url) {
-    return reply.code(400).send({ error: "url is required", code: "WEBHOOK_URL_REQUIRED" });
+    throw new ApiError(400, "WEBHOOK_URL_REQUIRED", "url is required");
   }
 
   try {
     new URL(body.url);
   } catch {
-    return reply.code(400).send({ error: "invalid webhook url", code: "WEBHOOK_URL_INVALID" });
+    throw new ApiError(400, "WEBHOOK_URL_INVALID", "invalid webhook url");
   }
 
   const target = webhookDispatcher.registerTarget(body.url);
@@ -203,7 +265,24 @@ app.post("/webhooks/register", async (request, reply) => {
 });
 
 app.get("/webhooks", async () => {
-  return { webhooks: webhookDispatcher.listTargets() };
+  return {
+    webhooks: webhookDispatcher.listTargets(),
+    consumerVerification: {
+      headers: ["x-railagent-signature", "x-railagent-timestamp"],
+      helper: "verifyWebhookSignature(secret, timestamp + '.' + rawBody)"
+    }
+  };
+});
+
+app.post("/webhooks/verify", async (request) => {
+  const body = request.body as { payload: string; signature?: string; timestamp?: string };
+  const result = verifyWebhookSignature({
+    secret: webhookSecret,
+    payload: body.payload,
+    signature: body.signature,
+    timestamp: body.timestamp
+  });
+  return result;
 });
 
 app.listen({ port, host: "0.0.0.0" }).then(() => {

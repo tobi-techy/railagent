@@ -1,134 +1,55 @@
-# RailAgent API
+# API examples (Postman / HTTP)
 
-Base URL (local): `http://localhost:3000`
+Base URL: `http://localhost:3000`
 
-## GET /health
+## 1) Parse intent (AI + fallback)
 
-Returns service health.
-
-## POST /intent/parse
-
-Deterministic multilingual intent parsing (EN/ES/PT/FR) with confidence and clarification prompts.
-
-## POST /quote
-
-Weighted route optimization for supported corridors (`USD->PHP`, `EUR->NGN`, `GBP->KES`) with transparent scoring breakdown.
-
-## POST /transfer
-
-Creates a transfer after policy checks and returns provider metadata.
-
-### Headers
-
-- `Idempotency-Key` (required)
-
-### Request
-
-```json
-{
-  "quoteId": "qt_123",
-  "recipient": "maria",
-  "amount": "100",
-  "fromToken": "USD",
-  "toToken": "PHP"
-}
+```bash
+curl -X POST http://localhost:3000/intent/parse \
+  -H 'content-type: application/json' \
+  -d '{"text":"Send 120 USD to maria in Manila and convert to PHP"}'
 ```
 
-### Success response
+## 2) Quote route
 
-```json
-{
-  "id": "tr_idem_001",
-  "status": "submitted",
-  "policyDecision": {
-    "allowed": true,
-    "violations": []
-  },
-  "provider": {
-    "name": "mock-mento",
-    "mode": "mock"
-  }
-}
+```bash
+curl -X POST http://localhost:3000/quote \
+  -H 'content-type: application/json' \
+  -d '{"fromToken":"USD","toToken":"PHP","amount":"120","destinationChain":"celo"}'
 ```
 
-### Policy denial response
+## 3) Execute transfer (write-protected)
 
-```json
-{
-  "error": "Transfer policy denied",
-  "code": "POLICY_VIOLATION",
-  "policyDecision": {
-    "allowed": false,
-    "violations": [
-      {
-        "code": "POLICY_IDEMPOTENCY_KEY_REQUIRED",
-        "message": "Idempotency key is required",
-        "field": "idempotencyKey"
-      }
-    ]
-  }
-}
+```bash
+curl -X POST http://localhost:3000/transfer \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: dev_write_key' \
+  -H 'Idempotency-Key: idem_120_usd_php' \
+  -d '{"quoteId":"qt_demo_001","recipient":"maria","amount":"120","fromToken":"USD","toToken":"PHP"}'
 ```
 
-## GET /transfers/:id
+## 4) Register webhook (write-protected)
 
-Returns transfer status from in-memory store.
-
-## POST /webhooks/register
-
-Registers a webhook target (in-memory).
-
-### Request
-
-```json
-{
-  "url": "https://example.com/webhooks/railagent"
-}
+```bash
+curl -X POST http://localhost:3000/webhooks/register \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: dev_write_key' \
+  -d '{"url":"https://example.com/webhooks/railagent"}'
 ```
 
-### Response
+## 5) Verify webhook signature / replay window
 
-```json
-{
-  "webhook": {
-    "id": "wh_ab12cd34",
-    "url": "https://example.com/webhooks/railagent",
-    "createdAt": "2026-01-01T00:00:00.000Z"
-  }
-}
+```bash
+curl -X POST http://localhost:3000/webhooks/verify \
+  -H 'content-type: application/json' \
+  -d '{"payload":"{\"id\":\"evt_1\"}","timestamp":"1700000000","signature":"<hex>"}'
 ```
 
-## GET /webhooks
+## Error taxonomy snapshot
 
-Returns all registered webhook targets.
-
-## Webhook delivery
-
-RailAgent emits transfer lifecycle events:
-
-- `transfer.submitted`
-- `transfer.settled`
-- `transfer.failed` (reserved)
-
-Headers sent with each webhook:
-
-- `x-railagent-event`
-- `x-railagent-signature` (hex HMAC-SHA256)
-
-### Signature verification example (Node.js)
-
-```ts
-import crypto from "node:crypto";
-
-const secret = process.env.WEBHOOK_SECRET!;
-const rawBody = requestBodyAsRawString;
-const signature = incomingHeaders["x-railagent-signature"];
-
-const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-
-if (signature !== expected) {
-  throw new Error("Invalid webhook signature");
-}
-```
-
-Retries use in-memory backoff for MVP (1s, 3s, 7s).
+- `VALIDATION_ERROR` – malformed payloads
+- `UNAUTHORIZED` – missing/invalid API key
+- `RATE_LIMITED` – request burst above configured threshold
+- `POLICY_VIOLATION` – transfer denied by policy controls
+- `TRANSFER_NOT_FOUND` – unknown transfer id
+- `INTERNAL_ERROR` – unexpected failure

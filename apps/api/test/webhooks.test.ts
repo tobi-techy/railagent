@@ -7,8 +7,9 @@ test("generates deterministic webhook signature", () => {
   const dispatcher = new WebhookDispatcher("secret_123");
   const payload = JSON.stringify({ id: "evt_1", type: "transfer.submitted" });
 
-  const expected = crypto.createHmac("sha256", "secret_123").update(payload).digest("hex");
-  assert.equal(dispatcher.signPayload(payload), expected);
+  const ts = "1700000000";
+  const expected = crypto.createHmac("sha256", "secret_123").update(`${ts}.${payload}`).digest("hex");
+  assert.equal(dispatcher.signPayload(payload, ts), expected);
 
   dispatcher.stop();
 });

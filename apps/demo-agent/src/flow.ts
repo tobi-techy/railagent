@@ -41,7 +41,20 @@ export interface DemoAgentClient {
 }
 
 export function createClient(baseUrl: string): DemoAgentClient {
-  return new RailAgentSdk({ baseUrl });
+  const sdk = new RailAgentSdk({ baseUrl });
+  const writeKey = process.env.RAILAGENT_WRITE_API_KEY;
+
+  return {
+    parseIntent: (payload) => sdk.parseIntent(payload),
+    quote: (payload) => sdk.quote(payload),
+    transfer: (payload, options) =>
+      sdk.transfer(payload, {
+        headers: {
+          ...(options?.headers ?? {}),
+          ...(writeKey ? { "x-api-key": writeKey } : {})
+        }
+      })
+  };
 }
 
 export async function runAgentFlow(

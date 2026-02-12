@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseIntent } from "../src/index.js";
+import { parseIntent, parseIntentWithProvider } from "../src/index.js";
 
 test("parses English transfer request", () => {
   const result = parseIntent("Send 120 USD to maria in Manila and convert to PHP");
@@ -46,4 +46,25 @@ test("asks clarification when key fields are missing", () => {
   assert.equal(result.needsClarification, true);
   assert.ok(result.clarificationQuestions.length > 0);
   assert.ok(result.confidence < 0.8);
+});
+
+test("gemini invalid structured output falls back to deterministic parser", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        candidates: [{ content: { parts: [{ text: "{\"not_schema\":true}" }] } }]
+      }),
+      { status: 200 }
+    ) as any;
+
+  const result = await parseIntentWithProvider("send 100 usd to php to maria", {
+    provider: "gemini",
+    geminiApiKey: "dummy"
+  });
+
+  assert.equal(result.provider, "deterministic");
+  assert.equal(typeof result.fallbackReason, "string");
+
+  globalThis.fetch = originalFetch;
 });

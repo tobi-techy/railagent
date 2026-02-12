@@ -1,66 +1,37 @@
-# 2-minute judge demo script (Phase 3a)
+# Judge demo script (real-world remittance scenarios)
 
-## Setup
+## Scenario 1: Freelancer payout (USD -> PHP)
+- User: “Send 120 USD to Maria in Manila, convert to PHP.”
+- Show `/intent/parse` structured extraction.
+- Show `/quote` best + alternatives.
+- Execute `/transfer` with API key + idempotency header.
+- Mention policy and audit log event emitted.
 
-```bash
-pnpm install
-cp .env.example .env
-```
+## Scenario 2: Family remittance (EUR -> NGN)
+- User: “Transfer 80 EUR to my brother in Lagos in NGN.”
+- Show destination detection and corridor routing.
+- Show low-fee route recommendation and ETA.
 
-## Terminal 1 — start API
+## Scenario 3: Marketplace settlement (GBP -> KES)
+- User: “Pay 300 GBP settlement to vendor_kenya in KES.”
+- Demonstrate policy limits by trying 3000 GBP (blocked by per-currency cap).
+- Show returned `POLICY_VIOLATION` with explicit violation details.
+
+---
+
+## Live demo commands
 
 ```bash
 pnpm dev:api
 ```
 
-Wait for: `RailAgent API listening on 3000`
+```bash
+pnpm demo:live
+```
 
-## Terminal 2 — demo agent
-
-### A) Interactive flow
+Manual one-shot examples:
 
 ```bash
-pnpm -C apps/demo-agent dev
+pnpm -C apps/demo-agent run --text "Transfer 80 EUR to jose in Lagos to NGN" --confirm
+pnpm -C apps/demo-agent run --text "Pay 300 GBP to vendor_kenya in KES" --confirm
 ```
-
-Paste prompt:
-
-```text
-send 100 usd to php to maria
-```
-
-Expected flow:
-1. Agent parses intent (`/intent/parse`)
-2. Agent gets route quote (`/quote`)
-3. Agent prints best route + alternatives
-4. Agent asks: `Execute transfer? (y/n)`
-5. Type `y`
-6. Agent executes transfer (`/transfer`) and prints:
-   - final status
-   - transfer id
-
-### B) Clarification flow
-
-In interactive mode, try:
-
-```text
-send money
-```
-
-Expected: agent prints clarification questions and does not execute.
-
-### C) One-shot quote-only
-
-```bash
-pnpm -C apps/demo-agent run --text "send 50 eur to ngn to david"
-```
-
-Expected: quote summary only, with confirmation required message.
-
-### D) One-shot execute
-
-```bash
-pnpm -C apps/demo-agent run --text "send 50 eur to ngn to david" --confirm
-```
-
-Expected: transfer submitted with transfer id.

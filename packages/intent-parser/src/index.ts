@@ -1,5 +1,8 @@
+import { z } from "zod";
+
 export type SupportedLanguage = "en" | "es" | "pt" | "fr";
 export type ParsedIntentType = "transfer" | "quote" | "unknown";
+export type LlmProviderMode = "deterministic" | "openclaw" | "gemini";
 
 export interface ParsedIntentFields {
   amount?: number;
@@ -17,7 +20,31 @@ export interface IntentParseResult {
   parsed: ParsedIntentFields;
   needsClarification: boolean;
   clarificationQuestions: string[];
+  provider: LlmProviderMode;
+  fallbackReason?: string;
 }
+
+export interface ParseIntentRuntimeOptions {
+  provider?: string;
+  model?: string;
+  geminiApiKey?: string;
+}
+
+const StructuredExtractionSchema = z.object({
+  intent: z.enum(["transfer", "quote", "unknown"]),
+  confidence: z.number().min(0).max(1),
+  parsed: z.object({
+    amount: z.number().positive().optional(),
+    sourceCurrency: z.string().min(3).max(6).optional(),
+    targetCurrency: z.string().min(3).max(6).optional(),
+    recipient: z.string().min(2).optional(),
+    destinationHint: z.string().optional(),
+    language: z.enum(["en", "es", "pt", "fr"]).default("en"),
+    rawText: z.string()
+  }),
+  needsClarification: z.boolean(),
+  clarificationQuestions: z.array(z.string())
+});
 
 type LanguageHints = {
   stopwords: string[];
@@ -118,9 +145,7 @@ function parseAmount(text: string): number | undefined {
   if (!amountMatch) return undefined;
 
   const raw = amountMatch[1];
-  const normalized = raw.includes(",") && raw.includes(".")
-    ? raw.replace(/,/g, "")
-    : raw.replace(",", ".");
+  const normalized = raw.includes(",") && raw.includes(".") ? raw.replace(/,/g, "") : raw.replace(",", ".");
 
   const parsed = Number.parseFloat(normalized);
   return Number.isFinite(parsed) ? parsed : undefined;
@@ -227,6 +252,97 @@ export function parseIntent(input: string): IntentParseResult {
       rawText: input
     },
     needsClarification: clarificationQuestions.length > 0,
-    clarificationQuestions
+    clarificationQuestions,
+    provider: "deterministic"
   };
+}
+
+function normalizeStructured(result: z.infer<typeof StructuredExtractionSchema>): IntentParseResult {
+  return {
+    ...result,
+    parsed: {
+      ...result.parsed,
+      sourceCurrency: result.parsed.sourceCurrency?.toUpperCase(),
+      targetCurrency: result.parsed.targetCurrency?.toUpperCase()
+    },
+    provider: "openclaw"
+  };
+}
+
+async function parseWithGemini(input: string, apiKey: string, model: string): Promise<IntentParseResult> {
+  const prompt = `Extract remittance intent into strict JSON only.\nSchema keys: intent, confidence, parsed, needsClarification, clarificationQuestions.\nInput: ${input}`;
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`GEMINI_HTTP_${response.status}`);
+  }
+
+  const payload = await response.json() as any;
+  const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("GEMINI_EMPTY_RESPONSE");
+
+  const parsedJson = JSON.parse(text);
+  const validated = StructuredExtractionSchema.parse({
+    ...parsedJson,
+    parsed: { ...parsedJson.parsed, rawText: input }
+  });
+
+  return {
+    ...validated,
+    parsed: {
+      ...validated.parsed,
+      sourceCurrency: validated.parsed.sourceCurrency?.toUpperCase(),
+      targetCurrency: validated.parsed.targetCurrency?.toUpperCase()
+    },
+    provider: "gemini"
+  };
+}
+
+async function parseWithOpenClawNative(_input: string): Promise<IntentParseResult> {
+  throw new Error("OPENCLAW_PROVIDER_UNAVAILABLE");
+}
+
+export async function parseIntentWithProvider(
+  input: string,
+  options: ParseIntentRuntimeOptions = {}
+): Promise<IntentParseResult> {
+  const provider = (options.provider ?? process.env.AI_PROVIDER ?? "deterministic").toLowerCase();
+  const geminiModel = options.model ?? process.env.GEMINI_MODEL ?? "gemini-1.5-flash";
+  const geminiApiKey = options.geminiApiKey ?? process.env.GEMINI_API_KEY;
+
+  if (provider === "gemini" && geminiApiKey) {
+    try {
+      return await parseWithGemini(input, geminiApiKey, geminiModel);
+    } catch (error) {
+      const fallback = parseIntent(input);
+      return {
+        ...fallback,
+        fallbackReason: error instanceof Error ? error.message : "GEMINI_PARSE_FAILED"
+      };
+    }
+  }
+
+  if (provider === "openclaw") {
+    try {
+      return await parseWithOpenClawNative(input);
+    } catch (error) {
+      const fallback = parseIntent(input);
+      return {
+        ...fallback,
+        fallbackReason: error instanceof Error ? error.message : "OPENCLAW_PARSE_FAILED"
+      };
+    }
+  }
+
+  return parseIntent(input);
 }
