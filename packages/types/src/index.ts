@@ -27,12 +27,16 @@ export const QuoteAlternativeSchema = z.object({
   route: z.string(),
   estimatedReceive: z.string(),
   fee: z.string(),
-  etaSeconds: z.number().int().positive()
+  etaSeconds: z.number().int().positive(),
+  score: z.number().optional(),
+  scoring: z.record(z.any()).optional(),
+  metrics: z.record(z.any()).optional()
 });
 
 export const QuoteResponseSchema = z.object({
   bestRoute: QuoteAlternativeSchema,
-  alternatives: z.array(QuoteAlternativeSchema)
+  alternatives: z.array(QuoteAlternativeSchema),
+  explanation: z.record(z.any()).optional()
 });
 
 export const TransferRequestSchema = z.object({

@@ -6,25 +6,15 @@ Base URL (local): `http://localhost:3000`
 
 Returns service health.
 
-**Response**
-
-```json
-{
-  "status": "ok",
-  "service": "railagent-api",
-  "timestamp": "2026-02-12T10:00:00.000Z"
-}
-```
-
 ## POST /intent/parse
 
-Mock intent parser with confidence score.
+Deterministic multilingual intent parsing (EN/ES/PT/FR) with confidence and clarification prompts.
 
 **Request**
 
 ```json
 {
-  "text": "Send 20 cUSD to 0xabc..."
+  "text": "Envoyer 200 EUR vers NGN pour ade"
 }
 ```
 
@@ -33,25 +23,42 @@ Mock intent parser with confidence score.
 ```json
 {
   "intent": "transfer",
-  "confidence": 0.9,
+  "confidence": 0.96,
   "extracted": {
-    "rawText": "Send 20 cUSD to 0xabc..."
+    "amount": 200,
+    "sourceCurrency": "EUR",
+    "targetCurrency": "NGN",
+    "recipient": "ade",
+    "destinationHint": "Nigeria",
+    "language": "fr",
+    "rawText": "Envoyer 200 EUR vers NGN pour ade",
+    "parsed": {
+      "amount": 200,
+      "sourceCurrency": "EUR",
+      "targetCurrency": "NGN",
+      "recipient": "ade",
+      "destinationHint": "Nigeria",
+      "language": "fr",
+      "rawText": "Envoyer 200 EUR vers NGN pour ade"
+    },
+    "needsClarification": false,
+    "clarificationQuestions": []
   }
 }
 ```
 
 ## POST /quote
 
-Mock route optimization response with alternatives.
+Weighted route optimization for supported corridors (`USD->PHP`, `EUR->NGN`, `GBP->KES`) with transparent scoring breakdown.
 
 **Request**
 
 ```json
 {
-  "fromToken": "cUSD",
-  "toToken": "USDC",
+  "fromToken": "USD",
+  "toToken": "PHP",
   "amount": "100",
-  "destinationChain": "base"
+  "destinationChain": "celo"
 }
 ```
 
@@ -60,25 +67,33 @@ Mock route optimization response with alternatives.
 ```json
 {
   "bestRoute": {
-    "route": "celo->mento->destination",
-    "estimatedReceive": "99.500000",
-    "fee": "0.10",
-    "etaSeconds": 45
-  },
-  "alternatives": [
-    {
-      "route": "celo->mento->destination",
-      "estimatedReceive": "99.500000",
-      "fee": "0.10",
-      "etaSeconds": 45
+    "route": "celo->mento->gcash",
+    "estimatedReceive": "5602.660000",
+    "fee": "0.11",
+    "etaSeconds": 42,
+    "score": 0.761905,
+    "scoring": {
+      "weights": {
+        "rate": 0.4,
+        "slippageBps": 0.2,
+        "gasUsd": 0.15,
+        "etaSec": 0.1,
+        "liquidityDepth": 0.15
+      }
     },
-    {
-      "route": "celo->bridge-x->destination",
-      "estimatedReceive": "99.200000",
-      "fee": "0.15",
-      "etaSeconds": 60
+    "metrics": {
+      "rate": 56.15,
+      "slippageBps": 20,
+      "gasUsd": 0.11,
+      "liquidityDepth": 680000
     }
-  ]
+  },
+  "alternatives": [],
+  "explanation": {
+    "corridor": "USD->PHP",
+    "strategy": "weighted-score(rate, slippage, gas, eta, liquidity)",
+    "consideredRoutes": 3
+  }
 }
 ```
 
@@ -86,34 +101,6 @@ Mock route optimization response with alternatives.
 
 Creates a mock transfer and returns submitted status.
 
-**Request**
-
-```json
-{
-  "quoteId": "q_123",
-  "recipient": "0xrecipient"
-}
-```
-
-**Response**
-
-```json
-{
-  "id": "tr_xxxxxxxx",
-  "status": "submitted"
-}
-```
-
 ## GET /transfers/:id
 
 Returns mock transfer settlement status.
-
-**Response**
-
-```json
-{
-  "id": "tr_xxxxxxxx",
-  "status": "settled",
-  "txHash": "0xabab..."
-}
-```

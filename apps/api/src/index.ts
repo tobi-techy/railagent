@@ -10,6 +10,8 @@ import {
   TransferStatusResponseSchema,
   HealthResponseSchema
 } from "@railagent/types";
+import { parseIntent } from "@railagent/intent-parser";
+import { scoreRoutes } from "@railagent/core";
 
 const app = Fastify({ logger: true });
 const port = Number(process.env.PORT ?? 3000);
@@ -30,14 +32,17 @@ app.post("/intent/parse", async (request, reply) => {
     return reply.code(400).send({ error: "Invalid request", details: parsed.error.flatten() });
   }
 
-  const text = parsed.data.text.toLowerCase();
-  const intent = text.includes("send") || text.includes("transfer") ? "transfer" : text.includes("quote") ? "quote" : "unknown";
-  const confidence = intent === "unknown" ? 0.55 : 0.9;
+  const parsedIntent = parseIntent(parsed.data.text);
 
   return ParseIntentResponseSchema.parse({
-    intent,
-    confidence,
-    extracted: { rawText: parsed.data.text }
+    intent: parsedIntent.intent,
+    confidence: parsedIntent.confidence,
+    extracted: {
+      ...parsedIntent.parsed,
+      parsed: parsedIntent.parsed,
+      needsClarification: parsedIntent.needsClarification,
+      clarificationQuestions: parsedIntent.clarificationQuestions
+    }
   });
 });
 
@@ -48,24 +53,32 @@ app.post("/quote", async (request, reply) => {
   }
 
   const amount = Number(parsed.data.amount);
-  const best = {
-    route: "celo->mento->destination",
-    estimatedReceive: Number.isFinite(amount) ? (amount * 0.995).toFixed(6) : parsed.data.amount,
-    fee: "0.10",
-    etaSeconds: 45
-  };
+
+  const optimized = scoreRoutes({
+    sourceCurrency: parsed.data.fromToken,
+    targetCurrency: parsed.data.toToken,
+    amount: Number.isFinite(amount) ? amount : 0
+  });
+
+  const toApiRoute = (item: (typeof optimized.alternatives)[number]) => ({
+    route: item.candidate.route,
+    estimatedReceive: item.estimatedReceive,
+    fee: item.fee,
+    etaSeconds: item.etaSeconds,
+    score: item.score,
+    scoring: item.breakdown,
+    metrics: {
+      rate: item.candidate.rate,
+      slippageBps: item.candidate.slippageBps,
+      gasUsd: item.candidate.gasUsd,
+      liquidityDepth: item.candidate.liquidityDepth
+    }
+  });
 
   return QuoteResponseSchema.parse({
-    bestRoute: best,
-    alternatives: [
-      best,
-      {
-        route: "celo->bridge-x->destination",
-        estimatedReceive: Number.isFinite(amount) ? (amount * 0.992).toFixed(6) : parsed.data.amount,
-        fee: "0.15",
-        etaSeconds: 60
-      }
-    ]
+    bestRoute: toApiRoute(optimized.bestRoute),
+    alternatives: optimized.alternatives.map(toApiRoute),
+    explanation: optimized.explanation
   });
 });
 
