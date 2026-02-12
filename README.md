@@ -63,8 +63,50 @@ API runs on `http://localhost:3000` by default.
 ## Useful scripts
 
 - `pnpm dev:api` - start API in watch mode
+- `pnpm -C apps/demo-agent dev` - start interactive demo-agent REPL
+- `pnpm -C apps/demo-agent run --text "send 100 usd to php to maria" --confirm` - run one-shot transfer flow
 - `pnpm typecheck` - run TypeScript checks across workspaces
-- `pnpm test` - run all tests (core, provider selection, webhook signing)
+- `pnpm test` - run all tests (core, provider selection, webhook signing, demo-agent)
+
+## Agent demo
+
+The `apps/demo-agent` app provides a deterministic "AI-agent style" CLI on top of the existing API.
+No external LLM calls are required.
+
+### 1) Start API
+
+```bash
+pnpm dev:api
+```
+
+### 2) Interactive mode
+
+```bash
+pnpm -C apps/demo-agent dev
+```
+
+- Enter natural-language remittance requests.
+- Agent calls `/intent/parse` then `/quote`.
+- Agent explains best route and alternatives.
+- Agent asks `y/n` before calling `/transfer`.
+
+### 3) One-shot mode
+
+Quote only (no execution):
+
+```bash
+pnpm -C apps/demo-agent run --text "send 100 usd to php to maria"
+```
+
+Execute transfer (requires explicit confirm flag):
+
+```bash
+pnpm -C apps/demo-agent run --text "send 100 usd to php to maria" --confirm
+```
+
+If `/intent/parse` returns clarification requirements, the demo-agent prints those questions and does not execute.
+
+See `docs/demo-script.md` for a 2-minute judge flow.
 
 ## Quick curl examples
 

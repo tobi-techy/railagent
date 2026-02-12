@@ -4,9 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "dev": "tsx src/cli.ts",
+    "run": "tsx src/cli.ts run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@railagent/sdk-ts": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.6.3"
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3",
+    "@types/node": "^22.10.1"
   }
 }
