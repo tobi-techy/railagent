@@ -21,6 +21,18 @@ export interface PersistedTransfer {
   stateHistory: Array<{ status: TransferState; timestamp: string; txHash?: string }>;
 }
 
+export interface DeveloperApiKeyRecord {
+  id: string;
+  developerId: string;
+  label: string;
+  keyPrefix: string;
+  keyHash: string;
+  status: "active" | "revoked";
+  createdAt: string;
+  lastUsedAt?: string;
+  rateLimitPerMin?: number;
+}
+
 export class SqliteTransferStore {
   private readonly db: DatabaseSync;
 
@@ -76,8 +88,21 @@ export class SqliteTransferStore {
         FOREIGN KEY(transfer_id) REFERENCES transfers(id)
       );
 
+      CREATE TABLE IF NOT EXISTS developer_api_keys (
+        id TEXT PRIMARY KEY,
+        developer_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        key_prefix TEXT NOT NULL,
+        key_hash TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        rate_limit_per_min INTEGER
+      );
+
       CREATE INDEX IF NOT EXISTS idx_transfers_created_at ON transfers(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_history_transfer_id ON transfer_state_history(transfer_id, id);
+      CREATE INDEX IF NOT EXISTS idx_dev_keys_developer_id ON developer_api_keys(developer_id, created_at DESC);
     `);
   }
 
@@ -95,6 +120,100 @@ export class SqliteTransferStore {
       (quote_id, from_token, to_token, amount, payload_json, provider_mode, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(input.quoteId, input.fromToken, input.toToken, input.amount, JSON.stringify(input.payload), input.providerMode, now);
+  }
+
+  createDeveloperApiKey(input: {
+    id: string;
+    developerId: string;
+    label: string;
+    keyPrefix: string;
+    keyHash: string;
+    rateLimitPerMin?: number;
+  }): DeveloperApiKeyRecord {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO developer_api_keys
+      (id, developer_id, label, key_prefix, key_hash, status, created_at, last_used_at, rate_limit_per_min)
+      VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, ?)
+    `).run(
+      input.id,
+      input.developerId,
+      input.label,
+      input.keyPrefix,
+      input.keyHash,
+      now,
+      input.rateLimitPerMin ?? null
+    );
+
+    return this.getDeveloperApiKeyById(input.id)!;
+  }
+
+  getDeveloperApiKeyById(id: string): DeveloperApiKeyRecord | undefined {
+    const row = this.db.prepare(`SELECT * FROM developer_api_keys WHERE id = ?`).get(id) as any;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      developerId: row.developer_id,
+      label: row.label,
+      keyPrefix: row.key_prefix,
+      keyHash: row.key_hash,
+      status: row.status,
+      createdAt: row.created_at,
+      lastUsedAt: row.last_used_at ?? undefined,
+      rateLimitPerMin: row.rate_limit_per_min ?? undefined
+    };
+  }
+
+  listDeveloperApiKeys(developerId?: string): DeveloperApiKeyRecord[] {
+    const rows = developerId
+      ? this.db.prepare(`SELECT * FROM developer_api_keys WHERE developer_id = ? ORDER BY created_at DESC`).all(developerId)
+      : this.db.prepare(`SELECT * FROM developer_api_keys ORDER BY created_at DESC`).all();
+    return (rows as any[]).map((row) => ({
+      id: row.id,
+      developerId: row.developer_id,
+      label: row.label,
+      keyPrefix: row.key_prefix,
+      keyHash: row.key_hash,
+      status: row.status,
+      createdAt: row.created_at,
+      lastUsedAt: row.last_used_at ?? undefined,
+      rateLimitPerMin: row.rate_limit_per_min ?? undefined
+    }));
+  }
+
+  findActiveDeveloperApiKeyByHash(keyHash: string): DeveloperApiKeyRecord | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM developer_api_keys WHERE key_hash = ? AND status = 'active' LIMIT 1`)
+      .get(keyHash) as any;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      developerId: row.developer_id,
+      label: row.label,
+      keyPrefix: row.key_prefix,
+      keyHash: row.key_hash,
+      status: row.status,
+      createdAt: row.created_at,
+      lastUsedAt: row.last_used_at ?? undefined,
+      rateLimitPerMin: row.rate_limit_per_min ?? undefined
+    };
+  }
+
+  revokeDeveloperApiKey(id: string): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(`UPDATE developer_api_keys SET status = 'revoked', last_used_at = COALESCE(last_used_at, ?) WHERE id = ?`)
+      .run(now, id) as any;
+    return (result.changes ?? 0) > 0;
+  }
+
+  touchDeveloperApiKeyLastUsed(id: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`UPDATE developer_api_keys SET last_used_at = ? WHERE id = ?`).run(now, id);
+  }
+
+  getRawDeveloperApiKeyRowForTest(id: string): any {
+    return this.db.prepare(`SELECT * FROM developer_api_keys WHERE id = ?`).get(id) as any;
   }
 
   createTransfer(input: {

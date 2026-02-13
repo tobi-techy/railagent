@@ -20,12 +20,17 @@ import { createMentoProviders, createStrictLiveProviders, ProviderNotConfiguredE
 import { createWebhookEvent, WebhookDispatcher } from "./webhooks.js";
 import {
   ApiError,
-  assertApiKey,
+  apiKeyPrefix,
+  assertAdminToken,
   enforceRateLimit,
+  generateRawApiKey,
+  hashApiKey,
   requestIdentity,
+  resolveWriteAuth,
   sanitizeForAudit,
   sendApiError,
-  verifyWebhookSignature
+  verifyWebhookSignature,
+  type ResolvedWriteAuth
 } from "./security.js";
 import { SqliteTransferStore } from "./store.js";
 
@@ -37,261 +42,230 @@ interface AgentSessionState {
   pendingQuote?: { fromToken: string; toToken: string; amount: number; recipient?: string; route: string };
 }
 
-const app = Fastify({ logger: true });
-const port = Number(process.env.PORT ?? 3000);
-const webhookSecret = process.env.WEBHOOK_SECRET ?? "dev_webhook_secret";
-const writeApiKeys = (process.env.API_WRITE_KEYS ?? "")
-  .split(",")
-  .map((v) => v.trim())
-  .filter(Boolean);
-const rateLimitPerMin = Number(process.env.RATE_LIMIT_PER_MIN ?? "60");
-const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS ?? "60000");
-
-const providerSelection = createMentoProviders(process.env);
-const policyConfig = readTransferPolicyConfig(process.env);
-const webhookDispatcher = new WebhookDispatcher(webhookSecret);
-const transferStore = new SqliteTransferStore(
-  process.env.RAILAGENT_DB_PATH ?? path.join(process.cwd(), ".data", "railagent.sqlite")
-);
-const agentSessions = new Map<string, AgentSessionState>();
-
-await app.register(cors, { origin: true });
-
-app.setErrorHandler((error, _request, reply) => {
-  sendApiError(reply, error);
-});
-
-app.addHook("onRequest", async (request, reply) => {
-  const correlationId = request.id;
-  reply.header("x-correlation-id", correlationId);
-
-  const identity = requestIdentity(request);
-  const rate = enforceRateLimit(`${identity}:${request.url}`, rateLimitPerMin, rateLimitWindowMs);
-  reply.header("x-ratelimit-remaining", String(rate.remaining));
-  reply.header("x-ratelimit-reset", String(Math.floor(rate.resetAt / 1000)));
-
-  if (!rate.allowed) {
-    throw new ApiError(429, "RATE_LIMITED", "Too many requests");
-  }
-
-  app.log.info({ correlationId, path: request.url, method: request.method, identity }, "request.received");
-});
-
-app.addHook("onClose", async () => {
-  webhookDispatcher.stop();
-});
-
-app.get("/health", async () => {
-  return HealthResponseSchema.parse({
-    status: "ok",
-    service: "railagent-api",
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.post("/intent/parse", async (request) => {
-  const parsed = ParseIntentRequestSchema.safeParse(request.body);
-  if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
-
-  const parsedIntent = await parseIntentWithProvider(parsed.data.text, {
-    provider: process.env.AI_PROVIDER,
-    model: process.env.AI_MODEL,
-    geminiApiKey: process.env.GEMINI_API_KEY
-  });
-
-  return ParseIntentResponseSchema.parse({
-    intent: parsedIntent.intent,
-    confidence: parsedIntent.confidence,
-    extracted: {
-      ...parsedIntent.parsed,
-      parsed: parsedIntent.parsed,
-      needsClarification: parsedIntent.needsClarification,
-      clarificationQuestions: parsedIntent.clarificationQuestions,
-      provider: parsedIntent.provider,
-      fallbackReason: parsedIntent.fallbackReason
-    }
-  });
-});
-
-function shouldUseStrictLive(fromToken: string, toToken: string): boolean {
-  return (process.env.MENTO_PROVIDER_MODE === "live" && fromToken.toUpperCase() === "EUR" && toToken.toUpperCase() === "NGN");
+interface BuildAppOptions {
+  env?: NodeJS.ProcessEnv;
+  dbPath?: string;
 }
 
-function resolveProvidersForCorridor(fromToken: string, toToken: string) {
-  if (shouldUseStrictLive(fromToken, toToken)) {
-    return createStrictLiveProviders(process.env);
-  }
-  return providerSelection;
-}
+export function buildApp(options: BuildAppOptions = {}) {
+  const env = options.env ?? process.env;
+  const app = Fastify({ logger: true });
+  const webhookSecret = env.WEBHOOK_SECRET ?? "dev_webhook_secret";
+  const writeApiKeys = (env.API_WRITE_KEYS ?? "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const defaultRateLimitPerMin = Number(env.RATE_LIMIT_PER_MIN ?? "60");
+  const rateLimitWindowMs = Number(env.RATE_LIMIT_WINDOW_MS ?? "60000");
+  const adminToken = env.API_ADMIN_TOKEN;
 
-app.post("/quote", async (request) => {
-  const parsed = QuoteRequestSchema.safeParse(request.body);
-  if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
+  const providerSelection = createMentoProviders(env);
+  const policyConfig = readTransferPolicyConfig(env);
+  const webhookDispatcher = new WebhookDispatcher(webhookSecret);
+  const transferStore = new SqliteTransferStore(
+    options.dbPath ?? env.RAILAGENT_DB_PATH ?? path.join(process.cwd(), ".data", "railagent.sqlite")
+  );
+  const agentSessions = new Map<string, AgentSessionState>();
 
-  const amount = Number(parsed.data.amount);
-  if (!Number.isFinite(amount) || amount <= 0) throw new ApiError(422, "INVALID_AMOUNT", "amount must be a positive number-like string");
-
-  try {
-    const providers = resolveProvidersForCorridor(parsed.data.fromToken, parsed.data.toToken);
-    if (providers.quoteProvider.mode === "live") {
-      const liveQuote = await providers.quoteProvider.quote({
-        fromToken: parsed.data.fromToken,
-        toToken: parsed.data.toToken,
-        amount
-      });
-
-      const comparison = compareRemittanceFees({
-        sourceCurrency: parsed.data.fromToken,
-        targetCurrency: parsed.data.toToken,
-        amount,
-        railAgentFeeUsd: Number(liveQuote.feeUsd)
-      });
-
-      const response = {
-        bestRoute: {
-          route: liveQuote.routeHint,
-          estimatedReceive: liveQuote.estimatedReceive,
-          fee: liveQuote.feeUsd,
-          etaSeconds: 90,
-          score: 1,
-          scoring: { live: true },
-          metrics: { rate: liveQuote.estimatedRate }
-        },
-        alternatives: [],
-        explanation: { provider: liveQuote.provider, mode: liveQuote.mode, live: true },
-        comparison
-      };
-
-      const quoteId = `qt_${crypto.createHash("sha256").update(`${parsed.data.fromToken}-${parsed.data.toToken}-${amount}-${liveQuote.routeHint}`).digest("hex").slice(0, 10)}`;
-      transferStore.saveQuoteSnapshot({
-        quoteId,
-        fromToken: parsed.data.fromToken,
-        toToken: parsed.data.toToken,
-        amount,
-        payload: response,
-        providerMode: "live"
-      });
-
-      return QuoteResponseSchema.parse(response);
-    }
-  } catch (error) {
-    if (error instanceof ProviderNotConfiguredError || error instanceof UnsupportedLiveCorridorError) {
-      throw new ApiError(422, error.code, error.message, { missingKeys: (error as ProviderNotConfiguredError).missingKeys });
-    }
-    throw error;
-  }
-
-  const optimized = scoreRoutes({
-    sourceCurrency: parsed.data.fromToken,
-    targetCurrency: parsed.data.toToken,
-    amount
-  });
-
-  const toApiRoute = (item: (typeof optimized.alternatives)[number]) => ({
-    route: item.candidate.route,
-    estimatedReceive: item.estimatedReceive,
-    fee: item.fee,
-    etaSeconds: item.etaSeconds,
-    score: item.score,
-    scoring: item.breakdown,
-    metrics: {
-      rate: item.candidate.rate,
-      slippageBps: item.candidate.slippageBps,
-      gasUsd: item.candidate.gasUsd,
-      liquidityDepth: item.candidate.liquidityDepth
-    }
-  });
-
-  const comparison = compareRemittanceFees({
-    sourceCurrency: parsed.data.fromToken,
-    targetCurrency: parsed.data.toToken,
-    amount,
-    railAgentFeeUsd: Number(optimized.bestRoute.fee)
-  });
-
-  const response = {
-    bestRoute: toApiRoute(optimized.bestRoute),
-    alternatives: optimized.alternatives.map(toApiRoute),
-    explanation: optimized.explanation,
-    comparison
+  const applyRateLimit = (identity: string, route: string, reply: any, perMinute = defaultRateLimitPerMin) => {
+    const rate = enforceRateLimit(`${identity}:${route}`, perMinute, rateLimitWindowMs);
+    reply.header("x-ratelimit-remaining", String(rate.remaining));
+    reply.header("x-ratelimit-reset", String(Math.floor(rate.resetAt / 1000)));
+    if (!rate.allowed) throw new ApiError(429, "RATE_LIMITED", "Too many requests");
   };
 
-  const quoteId = `qt_${crypto.createHash("sha256").update(`${parsed.data.fromToken}-${parsed.data.toToken}-${amount}-${response.bestRoute.route}`).digest("hex").slice(0, 10)}`;
-  transferStore.saveQuoteSnapshot({
-    quoteId,
-    fromToken: parsed.data.fromToken,
-    toToken: parsed.data.toToken,
-    amount,
-    payload: response,
-    providerMode: providerSelection.quoteProvider.mode
+  const requireWriteAuth = (request: any): ResolvedWriteAuth => {
+    return resolveWriteAuth(request, {
+      legacyApiKeys: writeApiKeys,
+      findDeveloperKeyByHash: (keyHash) => transferStore.findActiveDeveloperApiKeyByHash(keyHash),
+      touchDeveloperKeyLastUsed: (id) => transferStore.touchDeveloperApiKeyLastUsed(id)
+    });
+  };
+
+  app.register(cors, { origin: true });
+
+  app.setErrorHandler((error, _request, reply) => {
+    sendApiError(reply, error);
   });
 
-  return QuoteResponseSchema.parse(response);
-});
+  app.addHook("onRequest", async (request, reply) => {
+    const correlationId = request.id;
+    reply.header("x-correlation-id", correlationId);
 
-app.post("/agent/message", async (request) => {
-  const parsed = AgentMessageRequestSchema.safeParse(request.body);
-  if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
+    const identity = requestIdentity(request);
+    applyRateLimit(identity, request.url, reply);
 
-  const session = agentSessions.get(parsed.data.sessionId) ?? {};
-  const parsedIntent = await parseIntentWithProvider(parsed.data.text, {
-    provider: process.env.AI_PROVIDER,
-    model: process.env.AI_MODEL,
-    geminiApiKey: process.env.GEMINI_API_KEY
+    app.log.info({ correlationId, path: request.url, method: request.method, identity }, "request.received");
   });
 
-  session.language = parsedIntent.parsed.language;
-  if (parsedIntent.parsed.recipient) session.lastRecipient = parsedIntent.parsed.recipient;
-  if (parsedIntent.parsed.recurringCadence) session.recurringPreference = parsedIntent.parsed.recurringCadence;
+  app.addHook("onClose", async () => {
+    webhookDispatcher.stop();
+  });
 
-  const wantsCheapest = /cheapest|menos caro|mais barato|moins cher/i.test(parsed.data.text);
+  app.get("/health", async () => {
+    return HealthResponseSchema.parse({
+      status: "ok",
+      service: "railagent-api",
+      timestamp: new Date().toISOString()
+    });
+  });
 
-  const amount = parsedIntent.parsed.amount;
-  const fromToken = parsedIntent.parsed.sourceCurrency;
-  const toToken = parsedIntent.parsed.targetCurrency;
-  const recipient = parsedIntent.parsed.recipient ?? session.lastRecipient;
+  app.post("/auth/keys", async (request, reply) => {
+    assertAdminToken(request, adminToken);
+    const body = request.body as { developerId?: string; label?: string; rateLimitPerMin?: number };
+    if (!body?.developerId?.trim()) throw new ApiError(400, "DEVELOPER_ID_REQUIRED", "developerId is required");
+    if (!body?.label?.trim()) throw new ApiError(400, "LABEL_REQUIRED", "label is required");
 
-  if (parsedIntent.needsClarification || !amount || !fromToken || !toToken) {
-    const qs = [...parsedIntent.clarificationQuestions];
-    if (!recipient && parsedIntent.intent === "transfer") qs.push("Who should receive this transfer?");
-    const response = {
-      sessionId: parsed.data.sessionId,
-      assistantResponse: `I can help with that. ${qs.join(" ")}`.trim(),
-      actionState: "clarify" as const,
-      confidence: parsedIntent.confidence,
-      memory: {
-        language: session.language,
-        lastRecipient: session.lastRecipient,
-        preferredCorridor: session.preferredCorridor,
-        recurringPreference: session.recurringPreference
-      }
+    const rawKey = generateRawApiKey();
+    const created = transferStore.createDeveloperApiKey({
+      id: `dak_${crypto.randomBytes(8).toString("hex")}`,
+      developerId: body.developerId.trim(),
+      label: body.label.trim(),
+      keyPrefix: apiKeyPrefix(rawKey),
+      keyHash: hashApiKey(rawKey),
+      rateLimitPerMin: body.rateLimitPerMin
+    });
+
+    return reply.code(201).send({
+      key: {
+        id: created.id,
+        developerId: created.developerId,
+        label: created.label,
+        keyPrefix: created.keyPrefix,
+        status: created.status,
+        createdAt: created.createdAt,
+        lastUsedAt: created.lastUsedAt,
+        rateLimitPerMin: created.rateLimitPerMin
+      },
+      rawKey
+    });
+  });
+
+  app.get("/auth/keys", async (request) => {
+    assertAdminToken(request, adminToken);
+    const query = request.query as { developerId?: string };
+    const keys = transferStore.listDeveloperApiKeys(query.developerId?.trim());
+    return {
+      keys: keys.map((k) => ({
+        id: k.id,
+        developerId: k.developerId,
+        label: k.label,
+        keyPrefix: k.keyPrefix,
+        status: k.status,
+        createdAt: k.createdAt,
+        lastUsedAt: k.lastUsedAt,
+        rateLimitPerMin: k.rateLimitPerMin
+      }))
     };
-    agentSessions.set(parsed.data.sessionId, session);
-    return AgentMessageResponseSchema.parse(response);
+  });
+
+  app.post("/auth/keys/:id/revoke", async (request, reply) => {
+    assertAdminToken(request, adminToken);
+    const { id } = request.params as { id: string };
+    const revoked = transferStore.revokeDeveloperApiKey(id);
+    if (!revoked) throw new ApiError(404, "KEY_NOT_FOUND", "Key not found");
+    return reply.send({ ok: true, id, status: "revoked" });
+  });
+
+  app.post("/intent/parse", async (request) => {
+    const parsed = ParseIntentRequestSchema.safeParse(request.body);
+    if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
+
+    const parsedIntent = await parseIntentWithProvider(parsed.data.text, {
+      provider: env.AI_PROVIDER,
+      model: env.AI_MODEL,
+      geminiApiKey: env.GEMINI_API_KEY
+    });
+
+    return ParseIntentResponseSchema.parse({
+      intent: parsedIntent.intent,
+      confidence: parsedIntent.confidence,
+      extracted: {
+        ...parsedIntent.parsed,
+        parsed: parsedIntent.parsed,
+        needsClarification: parsedIntent.needsClarification,
+        clarificationQuestions: parsedIntent.clarificationQuestions,
+        provider: parsedIntent.provider,
+        fallbackReason: parsedIntent.fallbackReason
+      }
+    });
+  });
+
+  function shouldUseStrictLive(fromToken: string, toToken: string): boolean {
+    return (env.MENTO_PROVIDER_MODE === "live" && fromToken.toUpperCase() === "EUR" && toToken.toUpperCase() === "NGN");
   }
 
-  const optimized = scoreRoutes({ sourceCurrency: fromToken, targetCurrency: toToken, amount });
-  const sorted = wantsCheapest
-    ? [...optimized.alternatives].sort((a, b) => Number(a.fee) - Number(b.fee))
-    : optimized.alternatives;
-  const bestRoute = sorted[0];
+  function resolveProvidersForCorridor(fromToken: string, toToken: string) {
+    if (shouldUseStrictLive(fromToken, toToken)) {
+      return createStrictLiveProviders(env);
+    }
+    return providerSelection;
+  }
 
-  const quote = {
-    bestRoute: {
-      route: bestRoute.candidate.route,
-      estimatedReceive: bestRoute.estimatedReceive,
-      fee: bestRoute.fee,
-      etaSeconds: bestRoute.etaSeconds,
-      score: bestRoute.score,
-      scoring: bestRoute.breakdown,
-      metrics: {
-        rate: bestRoute.candidate.rate,
-        slippageBps: bestRoute.candidate.slippageBps,
-        gasUsd: bestRoute.candidate.gasUsd,
-        liquidityDepth: bestRoute.candidate.liquidityDepth
+  app.post("/quote", async (request) => {
+    const parsed = QuoteRequestSchema.safeParse(request.body);
+    if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
+
+    const amount = Number(parsed.data.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new ApiError(422, "INVALID_AMOUNT", "amount must be a positive number-like string");
+
+    try {
+      const providers = resolveProvidersForCorridor(parsed.data.fromToken, parsed.data.toToken);
+      if (providers.quoteProvider.mode === "live") {
+        const liveQuote = await providers.quoteProvider.quote({
+          fromToken: parsed.data.fromToken,
+          toToken: parsed.data.toToken,
+          amount
+        });
+
+        const comparison = compareRemittanceFees({
+          sourceCurrency: parsed.data.fromToken,
+          targetCurrency: parsed.data.toToken,
+          amount,
+          railAgentFeeUsd: Number(liveQuote.feeUsd)
+        });
+
+        const response = {
+          bestRoute: {
+            route: liveQuote.routeHint,
+            estimatedReceive: liveQuote.estimatedReceive,
+            fee: liveQuote.feeUsd,
+            etaSeconds: 90,
+            score: 1,
+            scoring: { live: true },
+            metrics: { rate: liveQuote.estimatedRate }
+          },
+          alternatives: [],
+          explanation: { provider: liveQuote.provider, mode: liveQuote.mode, live: true },
+          comparison
+        };
+
+        const quoteId = `qt_${crypto.createHash("sha256").update(`${parsed.data.fromToken}-${parsed.data.toToken}-${amount}-${liveQuote.routeHint}`).digest("hex").slice(0, 10)}`;
+        transferStore.saveQuoteSnapshot({
+          quoteId,
+          fromToken: parsed.data.fromToken,
+          toToken: parsed.data.toToken,
+          amount,
+          payload: response,
+          providerMode: "live"
+        });
+
+        return QuoteResponseSchema.parse(response);
       }
-    },
-    alternatives: sorted.map((item) => ({
+    } catch (error) {
+      if (error instanceof ProviderNotConfiguredError || error instanceof UnsupportedLiveCorridorError) {
+        throw new ApiError(422, error.code, error.message, { missingKeys: (error as ProviderNotConfiguredError).missingKeys });
+      }
+      throw error;
+    }
+
+    const optimized = scoreRoutes({
+      sourceCurrency: parsed.data.fromToken,
+      targetCurrency: parsed.data.toToken,
+      amount
+    });
+
+    const toApiRoute = (item: (typeof optimized.alternatives)[number]) => ({
       route: item.candidate.route,
       estimatedReceive: item.estimatedReceive,
       fee: item.fee,
@@ -304,34 +278,193 @@ app.post("/agent/message", async (request) => {
         gasUsd: item.candidate.gasUsd,
         liquidityDepth: item.candidate.liquidityDepth
       }
-    })),
-    explanation: optimized.explanation
-  };
+    });
 
-  const comparison = compareRemittanceFees({
-    sourceCurrency: fromToken,
-    targetCurrency: toToken,
-    amount,
-    railAgentFeeUsd: Number(quote.bestRoute.fee)
+    const comparison = compareRemittanceFees({
+      sourceCurrency: parsed.data.fromToken,
+      targetCurrency: parsed.data.toToken,
+      amount,
+      railAgentFeeUsd: Number(optimized.bestRoute.fee)
+    });
+
+    const response = {
+      bestRoute: toApiRoute(optimized.bestRoute),
+      alternatives: optimized.alternatives.map(toApiRoute),
+      explanation: optimized.explanation,
+      comparison
+    };
+
+    const quoteId = `qt_${crypto.createHash("sha256").update(`${parsed.data.fromToken}-${parsed.data.toToken}-${amount}-${response.bestRoute.route}`).digest("hex").slice(0, 10)}`;
+    transferStore.saveQuoteSnapshot({
+      quoteId,
+      fromToken: parsed.data.fromToken,
+      toToken: parsed.data.toToken,
+      amount,
+      payload: response,
+      providerMode: providerSelection.quoteProvider.mode
+    });
+
+    return QuoteResponseSchema.parse(response);
   });
 
-  session.preferredCorridor = `${fromToken}->${toToken}`;
-  session.pendingQuote = { fromToken, toToken, amount, recipient, route: quote.bestRoute.route };
-  agentSessions.set(parsed.data.sessionId, session);
+  app.post("/agent/message", async (request) => {
+    const parsed = AgentMessageRequestSchema.safeParse(request.body);
+    if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
 
-  if (!parsed.data.confirm) {
-    const relation = parsedIntent.parsed.recipientRelation ? ` (${parsedIntent.parsed.recipientRelation})` : "";
-    const recurring = session.recurringPreference ? ` Recurring preference: ${session.recurringPreference}.` : "";
+    const session = agentSessions.get(parsed.data.sessionId) ?? {};
+    const parsedIntent = await parseIntentWithProvider(parsed.data.text, {
+      provider: env.AI_PROVIDER,
+      model: env.AI_MODEL,
+      geminiApiKey: env.GEMINI_API_KEY
+    });
+
+    session.language = parsedIntent.parsed.language;
+    if (parsedIntent.parsed.recipient) session.lastRecipient = parsedIntent.parsed.recipient;
+    if (parsedIntent.parsed.recurringCadence) session.recurringPreference = parsedIntent.parsed.recurringCadence;
+
+    const wantsCheapest = /cheapest|menos caro|mais barato|moins cher/i.test(parsed.data.text);
+
+    const amount = parsedIntent.parsed.amount;
+    const fromToken = parsedIntent.parsed.sourceCurrency;
+    const toToken = parsedIntent.parsed.targetCurrency;
+    const recipient = parsedIntent.parsed.recipient ?? session.lastRecipient;
+
+    if (parsedIntent.needsClarification || !amount || !fromToken || !toToken) {
+      const qs = [...parsedIntent.clarificationQuestions];
+      if (!recipient && parsedIntent.intent === "transfer") qs.push("Who should receive this transfer?");
+      const response = {
+        sessionId: parsed.data.sessionId,
+        assistantResponse: `I can help with that. ${qs.join(" ")}`.trim(),
+        actionState: "clarify" as const,
+        confidence: parsedIntent.confidence,
+        memory: {
+          language: session.language,
+          lastRecipient: session.lastRecipient,
+          preferredCorridor: session.preferredCorridor,
+          recurringPreference: session.recurringPreference
+        }
+      };
+      agentSessions.set(parsed.data.sessionId, session);
+      return AgentMessageResponseSchema.parse(response);
+    }
+
+    const optimized = scoreRoutes({ sourceCurrency: fromToken, targetCurrency: toToken, amount });
+    const sorted = wantsCheapest
+      ? [...optimized.alternatives].sort((a, b) => Number(a.fee) - Number(b.fee))
+      : optimized.alternatives;
+    const bestRoute = sorted[0];
+
+    const quote = {
+      bestRoute: {
+        route: bestRoute.candidate.route,
+        estimatedReceive: bestRoute.estimatedReceive,
+        fee: bestRoute.fee,
+        etaSeconds: bestRoute.etaSeconds,
+        score: bestRoute.score,
+        scoring: bestRoute.breakdown,
+        metrics: {
+          rate: bestRoute.candidate.rate,
+          slippageBps: bestRoute.candidate.slippageBps,
+          gasUsd: bestRoute.candidate.gasUsd,
+          liquidityDepth: bestRoute.candidate.liquidityDepth
+        }
+      },
+      alternatives: sorted.map((item) => ({
+        route: item.candidate.route,
+        estimatedReceive: item.estimatedReceive,
+        fee: item.fee,
+        etaSeconds: item.etaSeconds,
+        score: item.score,
+        scoring: item.breakdown,
+        metrics: {
+          rate: item.candidate.rate,
+          slippageBps: item.candidate.slippageBps,
+          gasUsd: item.candidate.gasUsd,
+          liquidityDepth: item.candidate.liquidityDepth
+        }
+      })),
+      explanation: optimized.explanation
+    };
+
+    const comparison = compareRemittanceFees({
+      sourceCurrency: fromToken,
+      targetCurrency: toToken,
+      amount,
+      railAgentFeeUsd: Number(quote.bestRoute.fee)
+    });
+
+    session.preferredCorridor = `${fromToken}->${toToken}`;
+    session.pendingQuote = { fromToken, toToken, amount, recipient, route: quote.bestRoute.route };
+    agentSessions.set(parsed.data.sessionId, session);
+
+    if (!parsed.data.confirm) {
+      const relation = parsedIntent.parsed.recipientRelation ? ` (${parsedIntent.parsed.recipientRelation})` : "";
+      const recurring = session.recurringPreference ? ` Recurring preference: ${session.recurringPreference}.` : "";
+
+      return AgentMessageResponseSchema.parse({
+        sessionId: parsed.data.sessionId,
+        assistantResponse:
+          `Plan (${Math.round(parsedIntent.confidence * 100)}% confidence): send ${amount} ${fromToken} to ${recipient}${relation}, receiving about ${quote.bestRoute.estimatedReceive} ${toToken} via ${quote.bestRoute.route}. ` +
+          `RailAgent fee ~$${quote.bestRoute.fee}; legacy average ~$${comparison.legacyAverageFeeUsd} (save ~$${comparison.savingsUsd}, ${comparison.savingsPct}%). ${comparison.disclaimer}${recurring} Confirm to execute.`,
+        actionState: "quoted",
+        confidence: parsedIntent.confidence,
+        quote: { ...quote, comparison },
+        comparison,
+        memory: {
+          language: session.language,
+          lastRecipient: session.lastRecipient,
+          preferredCorridor: session.preferredCorridor,
+          recurringPreference: session.recurringPreference
+        }
+      });
+    }
+
+    const idempotencyKey = `idem_${crypto.createHash("sha256").update(`${parsed.data.sessionId}:${parsed.data.text}`).digest("hex").slice(0, 16)}`;
+    const policyDecision = evaluateTransferPolicy(
+      { amount, fromToken, toToken, recipient, idempotencyKey },
+      policyConfig
+    );
+    if (!policyDecision.allowed) throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
+
+    const quoteId = `qt_${crypto.createHash("sha256").update(`${fromToken}-${toToken}-${amount}-${quote.bestRoute.route}`).digest("hex").slice(0, 10)}`;
+    const providers = resolveProvidersForCorridor(fromToken, toToken);
+    const execution = await providers.executionProvider.executeTransfer({
+      quoteId,
+      recipient: recipient ?? "",
+      amount,
+      fromToken,
+      toToken,
+      idempotencyKey
+    });
+
+    transferStore.createTransfer({
+      id: execution.transferId,
+      quoteId,
+      recipient: recipient ?? "",
+      amount,
+      fromToken,
+      toToken,
+      providerName: execution.provider,
+      providerMode: execution.mode,
+      txHash: execution.txHash,
+      idempotencyKey
+    });
+
+    const transfer = {
+      id: execution.transferId,
+      status: "submitted" as const,
+      policyDecision: { allowed: true, violations: [] },
+      provider: { name: execution.provider, mode: execution.mode, fallbackReason: (providers as any).fallbackReason }
+    };
 
     return AgentMessageResponseSchema.parse({
       sessionId: parsed.data.sessionId,
-      assistantResponse:
-        `Plan (${Math.round(parsedIntent.confidence * 100)}% confidence): send ${amount} ${fromToken} to ${recipient}${relation}, receiving about ${quote.bestRoute.estimatedReceive} ${toToken} via ${quote.bestRoute.route}. ` +
-        `RailAgent fee ~$${quote.bestRoute.fee}; legacy average ~$${comparison.legacyAverageFeeUsd} (save ~$${comparison.savingsUsd}, ${comparison.savingsPct}%). ${comparison.disclaimer}${recurring} Confirm to execute.`,
-      actionState: "quoted",
+      assistantResponse: `Transfer submitted on Celo rail. transferId=${execution.transferId} status=submitted`,
+      actionState: "executed",
       confidence: parsedIntent.confidence,
       quote: { ...quote, comparison },
       comparison,
+      transfer,
       memory: {
         language: session.language,
         lastRecipient: session.lastRecipient,
@@ -339,194 +472,159 @@ app.post("/agent/message", async (request) => {
         recurringPreference: session.recurringPreference
       }
     });
-  }
-
-  const idempotencyKey = `idem_${crypto.createHash("sha256").update(`${parsed.data.sessionId}:${parsed.data.text}`).digest("hex").slice(0, 16)}`;
-  const policyDecision = evaluateTransferPolicy(
-    { amount, fromToken, toToken, recipient, idempotencyKey },
-    policyConfig
-  );
-  if (!policyDecision.allowed) throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
-
-  const quoteId = `qt_${crypto.createHash("sha256").update(`${fromToken}-${toToken}-${amount}-${quote.bestRoute.route}`).digest("hex").slice(0, 10)}`;
-  const providers = resolveProvidersForCorridor(fromToken, toToken);
-  const execution = await providers.executionProvider.executeTransfer({
-    quoteId,
-    recipient: recipient ?? "",
-    amount,
-    fromToken,
-    toToken,
-    idempotencyKey
   });
 
-  transferStore.createTransfer({
-    id: execution.transferId,
-    quoteId,
-    recipient: recipient ?? "",
-    amount,
-    fromToken,
-    toToken,
-    providerName: execution.provider,
-    providerMode: execution.mode,
-    txHash: execution.txHash,
-    idempotencyKey
-  });
+  app.post("/transfer", async (request, reply) => {
+    const auth = requireWriteAuth(request);
+    applyRateLimit(requestIdentity(request, auth), request.url, reply, auth.rateLimitPerMin ?? defaultRateLimitPerMin);
 
-  const transfer = {
-    id: execution.transferId,
-    status: "submitted" as const,
-    policyDecision: { allowed: true, violations: [] },
-    provider: { name: execution.provider, mode: execution.mode, fallbackReason: (providers as any).fallbackReason }
-  };
+    const parsed = TransferRequestSchema.safeParse(request.body);
+    if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
 
-  return AgentMessageResponseSchema.parse({
-    sessionId: parsed.data.sessionId,
-    assistantResponse: `Transfer submitted on Celo rail. transferId=${execution.transferId} status=submitted`,
-    actionState: "executed",
-    confidence: parsedIntent.confidence,
-    quote: { ...quote, comparison },
-    comparison,
-    transfer,
-    memory: {
-      language: session.language,
-      lastRecipient: session.lastRecipient,
-      preferredCorridor: session.preferredCorridor,
-      recurringPreference: session.recurringPreference
+    const idempotencyKey = request.headers["idempotency-key"]?.toString();
+    const amount = Number(parsed.data.amount ?? "0");
+    const fromToken = parsed.data.fromToken ?? "";
+    const toToken = parsed.data.toToken ?? "";
+
+    const policyDecision = evaluateTransferPolicy({
+      amount,
+      fromToken,
+      toToken,
+      recipient: parsed.data.recipient,
+      idempotencyKey
+    }, policyConfig);
+
+    app.log.info({
+      event: "audit.transfer_policy",
+      correlationId: request.id,
+      developerId: auth.developerId,
+      source: auth.source,
+      payload: sanitizeForAudit(policyDecision)
+    }, "audit");
+
+    if (!policyDecision.allowed) throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
+
+    if (idempotencyKey) {
+      const existing = transferStore.getTransferByIdempotencyKey(idempotencyKey);
+      if (existing) {
+        return TransferResponseSchema.parse({
+          id: existing.id,
+          status: "submitted",
+          policyDecision: { allowed: true, violations: [] },
+          provider: { name: existing.providerName, mode: existing.providerMode, fallbackReason: providerSelection.fallbackReason }
+        });
+      }
     }
-  });
-});
 
-app.post("/transfer", async (request) => {
-  assertApiKey(request, writeApiKeys);
-  const parsed = TransferRequestSchema.safeParse(request.body);
-  if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
-
-  const idempotencyKey = request.headers["idempotency-key"]?.toString();
-  const amount = Number(parsed.data.amount ?? "0");
-  const fromToken = parsed.data.fromToken ?? "";
-  const toToken = parsed.data.toToken ?? "";
-
-  const policyDecision = evaluateTransferPolicy({
-    amount,
-    fromToken,
-    toToken,
-    recipient: parsed.data.recipient,
-    idempotencyKey
-  }, policyConfig);
-
-  app.log.info({ event: "audit.transfer_policy", correlationId: request.id, payload: sanitizeForAudit(policyDecision) }, "audit");
-
-  if (!policyDecision.allowed) throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
-
-  if (idempotencyKey) {
-    const existing = transferStore.getTransferByIdempotencyKey(idempotencyKey);
-    if (existing) {
-      return TransferResponseSchema.parse({
-        id: existing.id,
-        status: "submitted",
-        policyDecision: { allowed: true, violations: [] },
-        provider: { name: existing.providerName, mode: existing.providerMode, fallbackReason: providerSelection.fallbackReason }
+    const providers = resolveProvidersForCorridor(fromToken, toToken);
+    let execution;
+    try {
+      execution = await providers.executionProvider.executeTransfer({
+        quoteId: parsed.data.quoteId,
+        recipient: parsed.data.recipient ?? "",
+        amount,
+        fromToken,
+        toToken,
+        idempotencyKey: idempotencyKey ?? `idem_${crypto.randomBytes(8).toString("hex")}`
       });
+    } catch (error) {
+      if (error instanceof ProviderNotConfiguredError || error instanceof UnsupportedLiveCorridorError) {
+        throw new ApiError(422, error.code, error.message, { missingKeys: (error as ProviderNotConfiguredError).missingKeys });
+      }
+      throw error;
     }
-  }
 
-  const providers = resolveProvidersForCorridor(fromToken, toToken);
-  let execution;
-  try {
-    execution = await providers.executionProvider.executeTransfer({
+    transferStore.createTransfer({
+      id: execution.transferId,
       quoteId: parsed.data.quoteId,
       recipient: parsed.data.recipient ?? "",
       amount,
       fromToken,
       toToken,
-      idempotencyKey: idempotencyKey ?? `idem_${crypto.randomBytes(8).toString("hex")}`
+      providerName: execution.provider,
+      providerMode: execution.mode,
+      txHash: execution.txHash,
+      idempotencyKey
     });
-  } catch (error) {
-    if (error instanceof ProviderNotConfiguredError || error instanceof UnsupportedLiveCorridorError) {
-      throw new ApiError(422, error.code, error.message, { missingKeys: (error as ProviderNotConfiguredError).missingKeys });
-    }
-    throw error;
-  }
-
-  transferStore.createTransfer({
-    id: execution.transferId,
-    quoteId: parsed.data.quoteId,
-    recipient: parsed.data.recipient ?? "",
-    amount,
-    fromToken,
-    toToken,
-    providerName: execution.provider,
-    providerMode: execution.mode,
-    txHash: execution.txHash,
-    idempotencyKey
-  });
-  webhookDispatcher.enqueueEvent(createWebhookEvent("transfer.submitted", {
-    transferId: execution.transferId,
-    quoteId: parsed.data.quoteId,
-    provider: execution.provider,
-    status: execution.status
-  }));
-
-  setTimeout(() => {
-    transferStore.appendStatus(execution.transferId, "settled", execution.txHash);
-    webhookDispatcher.enqueueEvent(createWebhookEvent("transfer.settled", {
+    webhookDispatcher.enqueueEvent(createWebhookEvent("transfer.submitted", {
       transferId: execution.transferId,
       quoteId: parsed.data.quoteId,
-      txHash: execution.txHash,
       provider: execution.provider,
-      status: "settled"
+      status: execution.status
     }));
-  }, 50);
 
-  return TransferResponseSchema.parse({
-    id: execution.transferId,
-    status: "submitted",
-    policyDecision: { allowed: policyDecision.allowed, violations: policyDecision.violations },
-    provider: { name: execution.provider, mode: execution.mode, fallbackReason: (providers as any).fallbackReason }
+    setTimeout(() => {
+      transferStore.appendStatus(execution.transferId, "settled", execution.txHash);
+      webhookDispatcher.enqueueEvent(createWebhookEvent("transfer.settled", {
+        transferId: execution.transferId,
+        quoteId: parsed.data.quoteId,
+        txHash: execution.txHash,
+        provider: execution.provider,
+        status: "settled"
+      }));
+    }, 50);
+
+    return TransferResponseSchema.parse({
+      id: execution.transferId,
+      status: "submitted",
+      policyDecision: { allowed: policyDecision.allowed, violations: policyDecision.violations },
+      provider: { name: execution.provider, mode: execution.mode, fallbackReason: (providers as any).fallbackReason }
+    });
   });
-});
 
-app.get("/transfers/:id", async (request) => {
-  const { id } = request.params as { id: string };
-  const transfer = transferStore.getTransfer(id);
-  if (!transfer) throw new ApiError(404, "TRANSFER_NOT_FOUND", "Transfer not found");
+  app.get("/transfers/:id", async (request) => {
+    const { id } = request.params as { id: string };
+    const transfer = transferStore.getTransfer(id);
+    if (!transfer) throw new ApiError(404, "TRANSFER_NOT_FOUND", "Transfer not found");
 
-  return {
-    ...TransferStatusResponseSchema.parse({ id, status: transfer.status, txHash: transfer.txHash }),
-    provider: { name: transfer.providerName, mode: transfer.providerMode },
-    stateHistory: transfer.stateHistory,
-    updatedAt: transfer.updatedAt
-  };
-});
+    return {
+      ...TransferStatusResponseSchema.parse({ id, status: transfer.status, txHash: transfer.txHash }),
+      provider: { name: transfer.providerName, mode: transfer.providerMode },
+      stateHistory: transfer.stateHistory,
+      updatedAt: transfer.updatedAt
+    };
+  });
 
-app.get("/audit/transfers", async (request) => {
-  const q = request.query as { limit?: string };
-  const limit = Math.min(200, Math.max(1, Number(q.limit ?? "20")));
-  return { transfers: transferStore.listAudit(limit) };
-});
+  app.get("/audit/transfers", async (request) => {
+    const q = request.query as { limit?: string };
+    const limit = Math.min(200, Math.max(1, Number(q.limit ?? "20")));
+    return { transfers: transferStore.listAudit(limit) };
+  });
 
-app.post("/webhooks/register", async (request, reply) => {
-  assertApiKey(request, writeApiKeys);
-  const body = request.body as { url?: string };
-  if (!body?.url) throw new ApiError(400, "WEBHOOK_URL_REQUIRED", "url is required");
-  try { new URL(body.url); } catch { throw new ApiError(400, "WEBHOOK_URL_INVALID", "invalid webhook url"); }
-  const target = webhookDispatcher.registerTarget(body.url);
-  return reply.code(201).send({ webhook: target });
-});
+  app.post("/webhooks/register", async (request, reply) => {
+    const auth = requireWriteAuth(request);
+    applyRateLimit(requestIdentity(request, auth), request.url, reply, auth.rateLimitPerMin ?? defaultRateLimitPerMin);
 
-app.get("/webhooks", async () => ({
-  webhooks: webhookDispatcher.listTargets(),
-  consumerVerification: {
-    headers: ["x-railagent-signature", "x-railagent-timestamp"],
-    helper: "verifyWebhookSignature(secret, timestamp + '.' + rawBody)"
-  }
-}));
+    const body = request.body as { url?: string };
+    if (!body?.url) throw new ApiError(400, "WEBHOOK_URL_REQUIRED", "url is required");
+    try { new URL(body.url); } catch { throw new ApiError(400, "WEBHOOK_URL_INVALID", "invalid webhook url"); }
 
-app.post("/webhooks/verify", async (request) => {
-  const body = request.body as { payload: string; signature?: string; timestamp?: string };
-  return verifyWebhookSignature({ secret: webhookSecret, payload: body.payload, signature: body.signature, timestamp: body.timestamp });
-});
+    app.log.info({ event: "audit.webhook_register", correlationId: request.id, developerId: auth.developerId, source: auth.source }, "audit");
 
-app.listen({ port, host: "0.0.0.0" }).then(() => {
-  app.log.info(`RailAgent API listening on ${port}`);
-});
+    const target = webhookDispatcher.registerTarget(body.url);
+    return reply.code(201).send({ webhook: target });
+  });
+
+  app.get("/webhooks", async () => ({
+    webhooks: webhookDispatcher.listTargets(),
+    consumerVerification: {
+      headers: ["x-railagent-signature", "x-railagent-timestamp"],
+      helper: "verifyWebhookSignature(secret, timestamp + '.' + rawBody)"
+    }
+  }));
+
+  app.post("/webhooks/verify", async (request) => {
+    const body = request.body as { payload: string; signature?: string; timestamp?: string };
+    return verifyWebhookSignature({ secret: webhookSecret, payload: body.payload, signature: body.signature, timestamp: body.timestamp });
+  });
+
+  return app;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const app = buildApp();
+  const port = Number(process.env.PORT ?? 3000);
+  app.listen({ port, host: "0.0.0.0" }).then(() => {
+    app.log.info(`RailAgent API listening on ${port}`);
+  });
+}

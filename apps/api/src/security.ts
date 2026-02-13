@@ -13,14 +13,6 @@ export class ApiError extends Error {
   }
 }
 
-export function assertApiKey(request: FastifyRequest, allowedKeys: string[]): void {
-  if (allowedKeys.length === 0) return;
-  const key = request.headers["x-api-key"]?.toString();
-  if (!key || !allowedKeys.includes(key)) {
-    throw new ApiError(401, "UNAUTHORIZED", "Valid API key required");
-  }
-}
-
 export interface RateLimitBucket {
   count: number;
   resetAt: number;
@@ -51,8 +43,87 @@ export function enforceRateLimit(
   return { allowed: true, remaining: Math.max(0, limit - existing.count), resetAt: existing.resetAt };
 }
 
-export function requestIdentity(request: FastifyRequest): string {
-  const apiKey = request.headers["x-api-key"]?.toString();
+export function hashApiKey(rawKey: string): string {
+  return crypto.createHash("sha256").update(rawKey).digest("hex");
+}
+
+export function generateRawApiKey(): string {
+  return `rk_live_${crypto.randomBytes(24).toString("hex")}`;
+}
+
+export function apiKeyPrefix(rawKey: string): string {
+  return rawKey.slice(0, 12);
+}
+
+export interface ResolvedWriteAuth {
+  source: "developer" | "legacy";
+  developerId: string;
+  keyId?: string;
+  keyPrefix: string;
+  rateLimitPerMin?: number;
+}
+
+export interface DeveloperKeyLookup {
+  id: string;
+  developerId: string;
+  keyPrefix: string;
+  status: "active" | "revoked";
+  rateLimitPerMin?: number;
+}
+
+export function extractApiKey(request: FastifyRequest): string | undefined {
+  return request.headers["x-api-key"]?.toString();
+}
+
+export function assertAdminToken(request: FastifyRequest, adminToken?: string): void {
+  if (!adminToken) throw new ApiError(503, "ADMIN_TOKEN_NOT_CONFIGURED", "API admin is disabled");
+  const candidate =
+    request.headers["x-admin-token"]?.toString() ??
+    request.headers.authorization?.toString().replace(/^Bearer\s+/i, "");
+
+  if (!candidate || candidate !== adminToken) {
+    throw new ApiError(401, "UNAUTHORIZED_ADMIN", "Valid admin token required");
+  }
+}
+
+export function resolveWriteAuth(
+  request: FastifyRequest,
+  options: {
+    legacyApiKeys: string[];
+    findDeveloperKeyByHash: (keyHash: string) => DeveloperKeyLookup | undefined;
+    touchDeveloperKeyLastUsed: (id: string) => void;
+  }
+): ResolvedWriteAuth {
+  const apiKey = extractApiKey(request);
+  if (!apiKey) throw new ApiError(401, "UNAUTHORIZED", "Valid API key required");
+
+  const keyHash = hashApiKey(apiKey);
+  const resolved = options.findDeveloperKeyByHash(keyHash);
+  if (resolved && resolved.status === "active") {
+    options.touchDeveloperKeyLastUsed(resolved.id);
+    return {
+      source: "developer",
+      developerId: resolved.developerId,
+      keyId: resolved.id,
+      keyPrefix: resolved.keyPrefix,
+      rateLimitPerMin: resolved.rateLimitPerMin
+    };
+  }
+
+  if (options.legacyApiKeys.includes(apiKey)) {
+    return {
+      source: "legacy",
+      developerId: "legacy",
+      keyPrefix: apiKey.slice(0, 12)
+    };
+  }
+
+  throw new ApiError(401, "UNAUTHORIZED", "Valid API key required");
+}
+
+export function requestIdentity(request: FastifyRequest, auth?: ResolvedWriteAuth): string {
+  if (auth?.developerId) return `developer:${auth.developerId}`;
+  const apiKey = extractApiKey(request);
   if (apiKey) return `key:${apiKey.slice(0, 6)}`;
   const ip = request.ip || "unknown";
   return `ip:${ip}`;

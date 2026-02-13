@@ -26,6 +26,35 @@ pnpm dev:api
 
 The API starts on `http://localhost:3000` with mock providers — no secrets needed for local dev.
 
+### Developer-scoped API key onboarding
+
+Set an admin token for key management:
+
+```bash
+export API_ADMIN_TOKEN=super_admin_token
+```
+
+Create a key for a developer account (raw key is returned once):
+
+```bash
+curl -X POST http://localhost:3000/auth/keys \
+  -H 'content-type: application/json' \
+  -H "x-admin-token: $API_ADMIN_TOKEN" \
+  -d '{"developerId":"dev_acme","label":"prod-agent","rateLimitPerMin":120}'
+```
+
+Use the returned `rawKey` on write endpoints:
+
+```bash
+curl -X POST http://localhost:3000/transfer \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: <RAW_KEY>' \
+  -H 'Idempotency-Key: idem_acme_001' \
+  -d '{"quoteId":"qt_demo_001","recipient":"maria","amount":"120","fromToken":"USD","toToken":"PHP"}'
+```
+
+Legacy `API_WRITE_KEYS` values are still accepted for backward compatibility and logged with `source=legacy`.
+
 ## Integration example
 
 An AI agent needs to send a cross-border payment. Five lines with the SDK:
@@ -127,9 +156,12 @@ Policy violations return structured, machine-readable decisions:
 | `POST` | `/agent/message` | Natural-language agent conversation | — |
 | `POST` | `/intent/parse` | Structured intent extraction | — |
 | `POST` | `/quote` | Route optimization + fee comparison | — |
-| `POST` | `/transfer` | Execute transfer with policy checks | API key |
+| `POST` | `/auth/keys` | Create developer-scoped write key (returns raw once) | Admin token |
+| `GET` | `/auth/keys?developerId=...` | List developer keys | Admin token |
+| `POST` | `/auth/keys/:id/revoke` | Revoke a developer key | Admin token |
+| `POST` | `/transfer` | Execute transfer with policy checks | Developer API key (or legacy fallback) |
 | `GET` | `/transfers/:id` | Settlement status | — |
-| `POST` | `/webhooks/register` | Subscribe to transfer events | API key |
+| `POST` | `/webhooks/register` | Subscribe to transfer events | Developer API key (or legacy fallback) |
 | `GET` | `/webhooks` | List registered webhook targets | — |
 
 ## Webhook events
