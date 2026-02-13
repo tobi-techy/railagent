@@ -205,6 +205,26 @@ pnpm typecheck
 pnpm test
 ```
 
+## Landing page (developer-facing SaaS site)
+
+A dedicated landing app is available at `apps/landing` (Next.js + Tailwind).
+
+Run locally:
+
+```bash
+pnpm install
+pnpm dev:landing
+```
+
+Build/start for deployment:
+
+```bash
+pnpm build:landing
+pnpm start:landing
+```
+
+Default local URL: `http://localhost:3001`
+
 ## License
 
 MIT

@@ -9,6 +9,9 @@
     "dev:api": "pnpm -C apps/api dev",
     "dev:web": "pnpm -C apps/web dev",
     "build:web": "pnpm -C apps/web build",
+    "dev:landing": "pnpm -C apps/landing dev",
+    "build:landing": "pnpm -C apps/landing build",
+    "start:landing": "pnpm -C apps/landing start",
     "demo:live": "pnpm -C apps/demo-agent run --text \"Send 120 USD to maria in Manila and convert to PHP\" --confirm",
     "typecheck": "pnpm -r typecheck",
     "test": "node --import tsx --test packages/**/test/**/*.test.ts apps/**/test/**/*.test.ts"
