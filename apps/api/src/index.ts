@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import path from "node:path";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import {
@@ -15,7 +16,7 @@ import {
 } from "@railagent/types";
 import { parseIntentWithProvider } from "@railagent/intent-parser";
 import { compareRemittanceFees, evaluateTransferPolicy, readTransferPolicyConfig, scoreRoutes } from "@railagent/core";
-import { createMentoProviders } from "@railagent/mento-adapter";
+import { createMentoProviders, createStrictLiveProviders, ProviderNotConfiguredError, UnsupportedLiveCorridorError } from "@railagent/mento-adapter";
 import { createWebhookEvent, WebhookDispatcher } from "./webhooks.js";
 import {
   ApiError,
@@ -26,6 +27,7 @@ import {
   sendApiError,
   verifyWebhookSignature
 } from "./security.js";
+import { SqliteTransferStore } from "./store.js";
 
 interface AgentSessionState {
   language?: string;
@@ -48,7 +50,9 @@ const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS ?? "60000");
 const providerSelection = createMentoProviders(process.env);
 const policyConfig = readTransferPolicyConfig(process.env);
 const webhookDispatcher = new WebhookDispatcher(webhookSecret);
-const transferStore = new Map<string, { status: "submitted" | "settled" | "failed"; txHash?: string }>();
+const transferStore = new SqliteTransferStore(
+  process.env.RAILAGENT_DB_PATH ?? path.join(process.cwd(), ".data", "railagent.sqlite")
+);
 const agentSessions = new Map<string, AgentSessionState>();
 
 await app.register(cors, { origin: true });
@@ -109,12 +113,73 @@ app.post("/intent/parse", async (request) => {
   });
 });
 
+function shouldUseStrictLive(fromToken: string, toToken: string): boolean {
+  return (process.env.MENTO_PROVIDER_MODE === "live" && fromToken.toUpperCase() === "EUR" && toToken.toUpperCase() === "NGN");
+}
+
+function resolveProvidersForCorridor(fromToken: string, toToken: string) {
+  if (shouldUseStrictLive(fromToken, toToken)) {
+    return createStrictLiveProviders(process.env);
+  }
+  return providerSelection;
+}
+
 app.post("/quote", async (request) => {
   const parsed = QuoteRequestSchema.safeParse(request.body);
   if (!parsed.success) throw new ApiError(400, "VALIDATION_ERROR", "Invalid request", parsed.error.flatten());
 
   const amount = Number(parsed.data.amount);
   if (!Number.isFinite(amount) || amount <= 0) throw new ApiError(422, "INVALID_AMOUNT", "amount must be a positive number-like string");
+
+  try {
+    const providers = resolveProvidersForCorridor(parsed.data.fromToken, parsed.data.toToken);
+    if (providers.quoteProvider.mode === "live") {
+      const liveQuote = await providers.quoteProvider.quote({
+        fromToken: parsed.data.fromToken,
+        toToken: parsed.data.toToken,
+        amount
+      });
+
+      const comparison = compareRemittanceFees({
+        sourceCurrency: parsed.data.fromToken,
+        targetCurrency: parsed.data.toToken,
+        amount,
+        railAgentFeeUsd: Number(liveQuote.feeUsd)
+      });
+
+      const response = {
+        bestRoute: {
+          route: liveQuote.routeHint,
+          estimatedReceive: liveQuote.estimatedReceive,
+          fee: liveQuote.feeUsd,
+          etaSeconds: 90,
+          score: 1,
+          scoring: { live: true },
+          metrics: { rate: liveQuote.estimatedRate }
+        },
+        alternatives: [],
+        explanation: { provider: liveQuote.provider, mode: liveQuote.mode, live: true },
+        comparison
+      };
+
+      const quoteId = `qt_${crypto.createHash("sha256").update(`${parsed.data.fromToken}-${parsed.data.toToken}-${amount}-${liveQuote.routeHint}`).digest("hex").slice(0, 10)}`;
+      transferStore.saveQuoteSnapshot({
+        quoteId,
+        fromToken: parsed.data.fromToken,
+        toToken: parsed.data.toToken,
+        amount,
+        payload: response,
+        providerMode: "live"
+      });
+
+      return QuoteResponseSchema.parse(response);
+    }
+  } catch (error) {
+    if (error instanceof ProviderNotConfiguredError || error instanceof UnsupportedLiveCorridorError) {
+      throw new ApiError(422, error.code, error.message, { missingKeys: (error as ProviderNotConfiguredError).missingKeys });
+    }
+    throw error;
+  }
 
   const optimized = scoreRoutes({
     sourceCurrency: parsed.data.fromToken,
@@ -144,12 +209,24 @@ app.post("/quote", async (request) => {
     railAgentFeeUsd: Number(optimized.bestRoute.fee)
   });
 
-  return QuoteResponseSchema.parse({
+  const response = {
     bestRoute: toApiRoute(optimized.bestRoute),
     alternatives: optimized.alternatives.map(toApiRoute),
     explanation: optimized.explanation,
     comparison
+  };
+
+  const quoteId = `qt_${crypto.createHash("sha256").update(`${parsed.data.fromToken}-${parsed.data.toToken}-${amount}-${response.bestRoute.route}`).digest("hex").slice(0, 10)}`;
+  transferStore.saveQuoteSnapshot({
+    quoteId,
+    fromToken: parsed.data.fromToken,
+    toToken: parsed.data.toToken,
+    amount,
+    payload: response,
+    providerMode: providerSelection.quoteProvider.mode
   });
+
+  return QuoteResponseSchema.parse(response);
 });
 
 app.post("/agent/message", async (request) => {
@@ -272,7 +349,8 @@ app.post("/agent/message", async (request) => {
   if (!policyDecision.allowed) throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
 
   const quoteId = `qt_${crypto.createHash("sha256").update(`${fromToken}-${toToken}-${amount}-${quote.bestRoute.route}`).digest("hex").slice(0, 10)}`;
-  const execution = await providerSelection.executionProvider.executeTransfer({
+  const providers = resolveProvidersForCorridor(fromToken, toToken);
+  const execution = await providers.executionProvider.executeTransfer({
     quoteId,
     recipient: recipient ?? "",
     amount,
@@ -281,13 +359,24 @@ app.post("/agent/message", async (request) => {
     idempotencyKey
   });
 
-  transferStore.set(execution.transferId, { status: "submitted", txHash: execution.txHash });
+  transferStore.createTransfer({
+    id: execution.transferId,
+    quoteId,
+    recipient: recipient ?? "",
+    amount,
+    fromToken,
+    toToken,
+    providerName: execution.provider,
+    providerMode: execution.mode,
+    txHash: execution.txHash,
+    idempotencyKey
+  });
 
   const transfer = {
     id: execution.transferId,
     status: "submitted" as const,
     policyDecision: { allowed: true, violations: [] },
-    provider: { name: execution.provider, mode: execution.mode, fallbackReason: providerSelection.fallbackReason }
+    provider: { name: execution.provider, mode: execution.mode, fallbackReason: (providers as any).fallbackReason }
   };
 
   return AgentMessageResponseSchema.parse({
@@ -314,11 +403,13 @@ app.post("/transfer", async (request) => {
 
   const idempotencyKey = request.headers["idempotency-key"]?.toString();
   const amount = Number(parsed.data.amount ?? "0");
+  const fromToken = parsed.data.fromToken ?? "";
+  const toToken = parsed.data.toToken ?? "";
 
   const policyDecision = evaluateTransferPolicy({
     amount,
-    fromToken: parsed.data.fromToken,
-    toToken: parsed.data.toToken,
+    fromToken,
+    toToken,
     recipient: parsed.data.recipient,
     idempotencyKey
   }, policyConfig);
@@ -327,17 +418,48 @@ app.post("/transfer", async (request) => {
 
   if (!policyDecision.allowed) throw new ApiError(422, "POLICY_VIOLATION", "Transfer policy denied", { policyDecision });
 
-  const execution = await providerSelection.executionProvider.executeTransfer({
+  if (idempotencyKey) {
+    const existing = transferStore.getTransferByIdempotencyKey(idempotencyKey);
+    if (existing) {
+      return TransferResponseSchema.parse({
+        id: existing.id,
+        status: "submitted",
+        policyDecision: { allowed: true, violations: [] },
+        provider: { name: existing.providerName, mode: existing.providerMode, fallbackReason: providerSelection.fallbackReason }
+      });
+    }
+  }
+
+  const providers = resolveProvidersForCorridor(fromToken, toToken);
+  let execution;
+  try {
+    execution = await providers.executionProvider.executeTransfer({
+      quoteId: parsed.data.quoteId,
+      recipient: parsed.data.recipient ?? "",
+      amount,
+      fromToken,
+      toToken,
+      idempotencyKey: idempotencyKey ?? `idem_${crypto.randomBytes(8).toString("hex")}`
+    });
+  } catch (error) {
+    if (error instanceof ProviderNotConfiguredError || error instanceof UnsupportedLiveCorridorError) {
+      throw new ApiError(422, error.code, error.message, { missingKeys: (error as ProviderNotConfiguredError).missingKeys });
+    }
+    throw error;
+  }
+
+  transferStore.createTransfer({
+    id: execution.transferId,
     quoteId: parsed.data.quoteId,
     recipient: parsed.data.recipient ?? "",
     amount,
-    fromToken: parsed.data.fromToken ?? "",
-    toToken: parsed.data.toToken ?? "",
-    idempotencyKey: idempotencyKey ?? ""
+    fromToken,
+    toToken,
+    providerName: execution.provider,
+    providerMode: execution.mode,
+    txHash: execution.txHash,
+    idempotencyKey
   });
-
-  transferStore.set(execution.transferId, { status: "submitted", txHash: execution.txHash });
-
   webhookDispatcher.enqueueEvent(createWebhookEvent("transfer.submitted", {
     transferId: execution.transferId,
     quoteId: parsed.data.quoteId,
@@ -346,7 +468,7 @@ app.post("/transfer", async (request) => {
   }));
 
   setTimeout(() => {
-    transferStore.set(execution.transferId, { status: "settled", txHash: execution.txHash });
+    transferStore.appendStatus(execution.transferId, "settled", execution.txHash);
     webhookDispatcher.enqueueEvent(createWebhookEvent("transfer.settled", {
       transferId: execution.transferId,
       quoteId: parsed.data.quoteId,
@@ -360,16 +482,27 @@ app.post("/transfer", async (request) => {
     id: execution.transferId,
     status: "submitted",
     policyDecision: { allowed: policyDecision.allowed, violations: policyDecision.violations },
-    provider: { name: execution.provider, mode: execution.mode, fallbackReason: providerSelection.fallbackReason }
+    provider: { name: execution.provider, mode: execution.mode, fallbackReason: (providers as any).fallbackReason }
   });
 });
 
 app.get("/transfers/:id", async (request) => {
   const { id } = request.params as { id: string };
-  const transfer = transferStore.get(id);
+  const transfer = transferStore.getTransfer(id);
   if (!transfer) throw new ApiError(404, "TRANSFER_NOT_FOUND", "Transfer not found");
 
-  return TransferStatusResponseSchema.parse({ id, status: transfer.status, txHash: transfer.txHash });
+  return {
+    ...TransferStatusResponseSchema.parse({ id, status: transfer.status, txHash: transfer.txHash }),
+    provider: { name: transfer.providerName, mode: transfer.providerMode },
+    stateHistory: transfer.stateHistory,
+    updatedAt: transfer.updatedAt
+  };
+});
+
+app.get("/audit/transfers", async (request) => {
+  const q = request.query as { limit?: string };
+  const limit = Math.min(200, Math.max(1, Number(q.limit ?? "20")));
+  return { transfers: transferStore.listAudit(limit) };
 });
 
 app.post("/webhooks/register", async (request, reply) => {
